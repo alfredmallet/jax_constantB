@@ -24,41 +24,62 @@ gradient/deflection numbers CONVERGING to N-independent values. Growth of
 max|grad B| with N that does not converge would be the sharpening signature
 discussed in the paper (Sec. 7.6) -- interesting rather than merely bad.
 
+DEALIAS (module constant below). With DEALIAS=True the study polishes with
+the Galerkin (2/3-rule) solve (see constantB_tools.py's module docstring and
+`Solver`) instead of plain collocation, and each row additionally records
+`tail_rms`/`tail_max` -- the discarded-band content of |B|^2-1
+(`Solver.tail_norm`), which for a retained-band B equals the TRUE continuum
+spectral tail by power-preserving alias folding. This single-grid diagnostic
+is the primary regularity check in dealias mode (spectral decay of the tail
+vs N => smooth branch; algebraic decay => a Hoelder exponent) and largely
+replaces the cross-grid polish loop that collocation mode relies on for
+resolution honesty; the zero-pad incoming-residual print above is retained
+as a cross-check either way. IMPORTANT: the CSV schema differs between
+DEALIAS=True/False runs (extra tail_rms/tail_max columns) -- CSV_NAME below
+picks a distinct filename automatically so old and new runs never collide
+mid-resume.
+
 Intended for the eps=0.98 switchback state:
     python3 resolution_check.py mlstate_fine.npz
 Runtime warning: even with the jit-compiled solve this can take a while at
 the largest default grid (96x96x192) -- the first call per grid pays a one-
 time XLA compilation cost, then each GN/CG solve runs as a single compiled
 program. Edit GRIDS/SWEEPS/CGIT to taste. Results are appended to
-resolution_check.csv so the run can be interrupted and resumed.
+CSV_NAME (see below) so the run can be interrupted and resumed.
 """
 import sys, time, csv, os
 import numpy as np
 from constantB_tools import Solver, zero_pad, carrier, load_state, numpy_wavenumbers, numpy_dif
 
-GRIDS  = [(48, 48, 96), (64, 64, 128), (96, 96, 192)]
-PCG    = True        # spectral preconditioner: essential at large N, where the
-                     # unpreconditioned JJ^T condition number grows like k_max^2
-                     # and a fixed CG budget solves a shrinking fraction per sweep
-SWEEPS = 30          # GN sweeps per grid (each sweep = one CG solve + update)
-CGIT   = 400         # CG iterations per sweep
-TARGET = 1e-8        # stop polishing early below this residual
+GRIDS   = [(48, 48, 96), (64, 64, 128), (96, 96, 192)]
+PCG     = True        # spectral preconditioner: essential at large N, where the
+                      # unpreconditioned JJ^T condition number grows like k_max^2
+                      # and a fixed CG budget solves a shrinking fraction per sweep
+SWEEPS  = 30          # GN sweeps per grid (each sweep = one CG solve + update)
+CGIT    = 400         # CG iterations per sweep
+TARGET  = 1e-8        # stop polishing early below this residual
+DEALIAS = False       # Galerkin 2/3-rule solve + tail_norm diagnostic (see module
+                      # docstring). NOTE (old CSVs/states were produced with plain
+                      # collocation, DEALIAS=False): switching this flips the CSV
+                      # schema (tail_rms/tail_max columns), so CSV_NAME below picks
+                      # a distinct filename per mode to keep resume logic honest.
+CSV_NAME = "resolution_check_galerkin.csv" if DEALIAS else "resolution_check.csv"
 
 def study(state_file):
     B0state, eps, meta = load_state(state_file)
     rows = []
     done = set()
-    if os.path.exists("resolution_check.csv"):        # resume: skip finished grids
-        with open("resolution_check.csv") as f:
+    if os.path.exists(CSV_NAME):        # resume: skip finished grids
+        with open(CSV_NAME) as f:
             for r in csv.DictReader(f):
                 done.add((int(r['Nx']), int(r['Ny']), int(r['Nz'])))
     for grid in GRIDS:
         if grid in done:
-            print(f"[{grid}] already in resolution_check.csv -- skipping")
+            print(f"[{grid}] already in {CSV_NAME} -- skipping")
             continue
         t0 = time.time()
         B = np.stack([np.asarray(zero_pad(B0state[i], grid)) for i in range(3)])
-        S = Solver(grid)
+        S = Solver(grid, dealias=DEALIAS)
         r1, r2 = S.residual(B)
         print(f"[{grid}] honest incoming residual: div {np.abs(r1).max():.2e}, "
               f"|B|^2-1 {np.abs(2*r2).max():.2e}")
@@ -78,13 +99,18 @@ def study(state_file):
                    maxdefl=float(defl.max()),
                    vol_rev=float((defl > 90).mean()),
                    minutes=(time.time()-t0)/60)
+        if DEALIAS:
+            tail_rms, tail_max = S.tail_norm(B)
+            row['tail_rms'] = tail_rms
+            row['tail_max'] = tail_max
         print(f"[{grid}] polished: | |B|-1 | {row['res_norm']:.2e}  "
               f"div {row['res_div']:.2e}  maxgrad {row['maxgrad']:.3f}  "
-              f"maxdefl {row['maxdefl']:.2f}  vol>90 {100*row['vol_rev']:.2f}%  "
+              f"maxdefl {row['maxdefl']:.2f}  vol>90 {100*row['vol_rev']:.2f}%  " +
+              (f"tail(rms/max) {row['tail_rms']:.2e}/{row['tail_max']:.2e}  " if DEALIAS else "") +
               f"({row['minutes']:.1f} min)")
         rows.append(row)
-        new = not os.path.exists("resolution_check.csv")
-        with open("resolution_check.csv", "a", newline="") as f:
+        new = not os.path.exists(CSV_NAME)
+        with open(CSV_NAME, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(row))
             if new: w.writeheader()
             w.writerow(row)
