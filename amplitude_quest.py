@@ -223,6 +223,7 @@ def main():
         g = [min(int(gi * 1.5) - int(gi * 1.5) % 2, gm) for gi, gm in zip(g, args.grid_max)]
         grids.append(tuple(g))
     de = args.de
+    streak = 0          # consecutive accepted steps since last reject/regrow
     hist = []
     fresh = not os.path.exists(args.csv)
 
@@ -234,10 +235,18 @@ def main():
         t0 = time.time()
         Btry, res, ci = S.gn(np.asarray(B) + de * seed, sweeps=args.sweeps,
                              cgit=args.cgit, pcg=args.pcg)
+        if args.res_ok < res < 10*args.res_ok:
+            # SALVAGE: nearly converged (dealias endgame gains ~2x/sweep) --
+            # spend extra sweeps rather than discarding a whole solve
+            Btry, res, ci = S.gn(Btry, sweeps=args.sweeps,
+                                 cgit=args.cgit, pcg=args.pcg)
+            print(f"  [salvage sweeps -> res {res:.1e}]")
         if res > args.res_ok:
             de *= 0.5
+            streak = 0
             print(f"  [step rejected: res {res:.1e}; halving d_eps -> {de:.4f}]")
             continue
+        streak += 1
         B, eps = Btry, eps + de
         d = diagnostics(S, B, car)
         row = dict(eps=round(eps, 4), de=de, grid=str(B.shape[1:]), res=res,
@@ -283,8 +292,12 @@ def main():
                 print("  gradient blow-up of THIS BRANCH (retry with --smooth,")
                 print("  other seeds/pushes before blaming the manifold).")
                 break
-        elif ci < args.cgit // 2:
+        elif streak >= 2 and de < args.de_max:
+            # regrow after two consecutive clean accepts. (The old criterion,
+            # CG finishing under half its budget, never fires in practice:
+            # cg=599 on every CSV row -- so de could shrink but never recover.)
             de = min(de * 1.3, args.de_max)
+            streak = 0
 
     if de <= args.de_min:
         print("STOP: d_eps underflow -- Gauss-Newton cannot re-converge even for")
