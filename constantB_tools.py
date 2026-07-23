@@ -91,7 +91,21 @@ import itertools
 from functools import partial
 
 import numpy as np
-from scipy.linalg import lu_factor, lu_solve
+# scipy is needed only by the seed/series machinery (dense LU for the carrier
+# ODE), not by the solver/polish path.  Import lazily so that load-state +
+# Gauss-Newton workflows (e.g. resolution checks) survive environments with a
+# broken or version-skewed scipy (seen on Kaggle: scipy built against a
+# different numpy than the one installed).
+try:
+    from scipy.linalg import lu_factor, lu_solve
+except Exception as _scipy_err:                       # noqa: F841
+    def _need_scipy(*a, **k):
+        raise ImportError(
+            "scipy.linalg unavailable (import failed: %r); it is required "
+            "only for seed_mode/series. Fix the numpy/scipy pairing, e.g. "
+            "pip install -U --force-reinstall numpy scipy, then restart "
+            "the kernel." % (_scipy_err,))
+    lu_factor = lu_solve = _need_scipy
 
 import jax
 jax.config.update("jax_enable_x64", True)
