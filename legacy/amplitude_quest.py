@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-amplitude_quest.py -- automated continuation to arbitrarily large amplitude,
-with adaptive stepping, automatic grid refinement, an optional
+amplitude_quest.py (JAX port) -- automated continuation to arbitrarily large
+amplitude, with adaptive stepping, automatic grid refinement, an optional
 Sobolev-weighted (smoothing) step, and an online gradient-divergence
 diagnostic. Designed to answer: DO THE GRADIENTS DIVERGE AT FINITE EPSILON,
 OR ONLY GROW (e.g. exponentially) WITHOUT BOUND?
 
-Thin driver over the `constantB` package (Solver, seeds, state files,
-quest_diagnostics, divergence_verdict); see constantB/ and DESIGN.md.
+This is a COPY of ../amplitude_quest.py, ported to jax_constantB's jax-backed
+Solver. See constantB_tools.py's module docstring for the host/device split
+(seed construction stays numpy/scipy; the Gauss-Newton + CG solve is
+jit-compiled). This file's own adaptive continuation loop -- accept/reject a
+step, halve/grow d_eps, refine the grid on spectral-tail growth, fit the
+divergence verdict -- is genuinely data-dependent host-side control flow (CSV
+writes, grid-ladder switching driven by runtime values) and is therefore left
+as an eager Python driver, exactly as in the original; only the per-step
+`gn` call is jit-compiled.
 
     python3 amplitude_quest.py                  # defaults: the paper's branch
     python3 amplitude_quest.py --eps-max 3.0 --grid-max 96 96 192 --smooth 1.0
@@ -50,25 +57,112 @@ re-measures the true residual of the incoming state; see the CSV column
 'incoming_res' after each grid change). For final states, run
 constantB_tools.py refine/diagnose as usual.
 
-DEALIAS (--dealias). Passes straight through to the Solver: with --dealias,
-every gn() call here (init, each continuation step, and each grid
-refinement) runs the Galerkin 2/3-rule solve (strict retained-band
-truncation) instead of plain collocation. It composes with --smooth without
-special-casing (they parameterise orthogonal hooks of the same Solver).
-NOTE: quest.npz/quest.csv produced with --dealias are not directly
-comparable, sample-for-sample, to runs without it -- the working-grid
-`res`/`tail` columns mean different things in each mode (collocation
-residual vs. projected Galerkin residual); rerun from scratch (fresh
---state/--csv) if switching modes.
+JAX NOTE. The Sobolev weight `s` and the `pcg` flag are resolved as static
+(trace-time) arguments of the underlying jit-compiled solve -- see
+WeightedSolver below, which only overrides the `_Wm2`/`_weighted` hooks of
+the jax-backed `Solver` in constantB_tools.py; the compiled GN/CG machinery
+itself is shared, not duplicated.
+
+DEALIAS (--dealias). Passes straight through to the underlying
+WeightedSolver/Solver: with --dealias, every gn() call here (init, each
+continuation step, and each grid refinement) runs the Galerkin 2/3-rule
+solve (strict retained-band truncation; see constantB_tools.py's module
+docstring and `Solver` for the full semantics) instead of plain collocation.
+It composes with --smooth without special-casing (they parameterise
+orthogonal hooks of the same Solver). NOTE: quest.npz/quest.csv produced
+with --dealias are not directly comparable, sample-for-sample, to runs
+without it -- the working-grid `res`/`tail` columns mean different things in
+each mode (collocation residual vs. projected Galerkin residual); rerun from
+scratch (fresh --state/--csv) if switching modes.
 """
 import argparse, csv, os, sys, time
 import numpy as np
+import jax.numpy as jnp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from constantB import (Solver, carrier, build_seed, zero_pad, save_state,
-                       load_state, quest_diagnostics, divergence_verdict)
+from constantB_tools import (Solver, carrier, build_seed, zero_pad,
+                             save_state, load_state, numpy_wavenumbers, numpy_dif)
 
-import jax.numpy as jnp
+
+class WeightedSolver(Solver):
+    """Minimum-norm Gauss-Newton in the Sobolev norm ||(1+k^2)^(s/2) dB||.
+
+    Subclasses the jax-backed Solver and only overrides the two hooks that
+    parameterise the weighted adjoint (`_Wm2`, `_weighted`); the jit-compiled
+    GN-sweep/CG machinery (`_gn_jit` in constantB_tools.py) is shared and
+    re-traces once per (shape, weighted, pcg, dealias) combination -- `s`
+    itself never enters the trace as a value, only through the concrete Wm2
+    array built here in plain Python before the jitted call. `dealias` is
+    passed straight through to the base `Solver` (see its `--dealias`
+    passthrough note in constantB_tools.py's CLI): Galerkin (2/3-rule)
+    truncation and the Sobolev-weighted step are independent, orthogonal
+    features and compose without special-casing."""
+
+    def __init__(self, shape, smooth=0.0, dealias=False):
+        super().__init__(shape, dealias=dealias)
+        self.s = float(smooth)
+
+    @property
+    def _weighted(self):
+        return self.s > 0
+
+    @property
+    def _Wm2(self):
+        if self.s > 0:
+            return (1.0 + self.K2) ** (-self.s)
+        return jnp.ones_like(self.K2)
+
+
+def diagnostics(S, B, car):
+    """Host-numpy diagnostics (one-shot per step; no benefit from jit).
+    Accepts B as a jax or numpy array."""
+    B = np.asarray(B)
+    nrm = np.sqrt((B ** 2).sum(0))
+    Bbar = B.mean(axis=(1, 2, 3)); nb = np.linalg.norm(Bbar)
+    cosM = np.clip((B * Bbar[:, None, None, None]).sum(0) / (nrm * nb), -1, 1)
+    defl = np.degrees(np.arccos(cosM))
+    K = numpy_wavenumbers(S.shape)
+    g2 = sum(numpy_dif(B[i], j, K) ** 2 for i in range(3) for j in range(3))
+    bh = np.abs(np.fft.fftn(B - car['B0'][:, None, None, :], axes=(1, 2, 3))) ** 2
+    # Spectral-tail monitor. CRITICAL dealias distinction: in Galerkin mode the
+    # field is hard-truncated at |k| < N/3, so its top-of-grid modes are
+    # identically zero and the collocation criterion (content just below the
+    # Nyquist wavenumber) can NEVER fire. Instead we measure (a) the field's
+    # content at the RETAINED-BAND EDGE (how hard the solution presses against
+    # its allowed band -- the direct analogue of the old criterion), and
+    # (b) the forced Galerkin tail of the constraint, tail_norm(B), which is
+    # the honest unresolved burden and gets its own threshold (--gtail-max).
+    dealias = bool(getattr(S, 'dealias', False))
+    tails = []
+    for ax, N in ((1, S.shape[0]), (2, S.shape[1]), (3, S.shape[2])):
+        kc = (N // 3) if dealias else (N // 2)     # band edge vs Nyquist
+        E = bh.sum(axis=tuple(i for i in range(4) if i != ax))[:kc]
+        tails.append(float(E[-3:].max() / E.max()))
+    out = dict(maxgrad=float(np.sqrt(g2.max())), Bbar=float(nb),
+               maxdefl=float(defl.max()), vol_rev=float((defl > 90).mean()),
+               tail=max(tails))
+    if dealias:
+        grms, gmax = S.tail_norm(B)
+        out['gal_tail_rms'], out['gal_tail_max'] = float(grms), float(gmax)
+    else:
+        out['gal_tail_rms'], out['gal_tail_max'] = float('nan'), float('nan')
+    return out
+
+
+def divergence_verdict(hist, window=6):
+    """Fit Q = [d ln g/d eps]^{-1} over the trailing window; extrapolate."""
+    pts = [(h['eps'], h['maxgrad']) for h in hist][-window-1:]
+    if len(pts) < 4:
+        return "insufficient data"
+    e = np.array([p[0] for p in pts]); g = np.log([p[1] for p in pts])
+    rate = np.diff(g) / np.diff(e)                 # d ln g / d eps at midpoints
+    em = 0.5 * (e[1:] + e[:-1]); Q = 1.0 / np.maximum(rate, 1e-12)
+    sl, ic = np.polyfit(em, Q, 1)
+    if sl >= -0.05 * abs(ic) / max(em[-1] - em[0], 1e-9):
+        return f"Q~const ({Q[-1]:.2f}): exponential growth, no finite-eps blow-up detected"
+    eps_star = -ic / sl
+    return (f"Q declining (slope {sl:.2f}): finite-eps blow-up candidate, "
+            f"extrapolated eps* ~ {eps_star:.2f}")
 
 
 def main():
@@ -101,7 +195,7 @@ def main():
     p.add_argument('--dealias', action='store_true',
                    help='Galerkin 2/3-rule solve: alias-free retained-band '
                         'equations; honest tail measured on the same grid '
-                        '(see the constantB Solver docstring)')
+                        '(see constantB_tools.py Solver docstring)')
     p.add_argument('--pcg', action='store_true', default=True)
     args = p.parse_args()
     modes = [tuple(m) for m in (args.modes or [[1, 1, 0.15], [1, -1, 0.15]])]
@@ -118,7 +212,7 @@ def main():
         car = carrier(args.A, args.c, grid[2])
         B = car['B0'][:, None, None, :] + 0.02 * build_seed(car, modes, grid,
                                                              tuple(args.prof))
-        B, res, _ = Solver(grid, dealias=args.dealias, smooth=args.smooth).gn(
+        B, res, _ = WeightedSolver(grid, args.smooth, dealias=args.dealias).gn(
             B, sweeps=args.sweeps, cgit=args.cgit, pcg=args.pcg)
         eps = 0.02
         print(f"initialised: eps=0.02, residual {res:.1e}")
@@ -137,7 +231,7 @@ def main():
         car = carrier(float(meta['A']), float(meta['c']), B.shape[3])
         seed = build_seed(car, [tuple(m) for m in np.atleast_2d(meta['modes'])],
                           B.shape[1:], tuple(np.array(meta['prof']).ravel()))
-        S = Solver(B.shape[1:], dealias=args.dealias, smooth=args.smooth)
+        S = WeightedSolver(B.shape[1:], args.smooth, dealias=args.dealias)
         t0 = time.time()
         Btry, res, ci = S.gn(np.asarray(B) + de * seed, sweeps=args.sweeps,
                              cgit=args.cgit, pcg=args.pcg)
@@ -154,7 +248,7 @@ def main():
             continue
         streak += 1
         B, eps = Btry, eps + de
-        d = quest_diagnostics(S, B, car)
+        d = diagnostics(S, B, car)
         row = dict(eps=round(eps, 4), de=de, grid=str(B.shape[1:]), res=res,
                    cg=ci, minutes=round((time.time()-t0)/60, 2), **d)
         hist.append(row)
@@ -187,7 +281,7 @@ def main():
                           for r in Solver(new, dealias=args.dealias).residual(Bf))
                 print(f"   [refining {B.shape[1:]} -> {new}; incoming honest "
                       f"residual {rin:.1e}]")
-                B, res, _ = Solver(new, dealias=args.dealias, smooth=args.smooth).gn(
+                B, res, _ = WeightedSolver(new, args.smooth, dealias=args.dealias).gn(
                     Bf, sweeps=args.sweeps + 4, cgit=args.cgit, pcg=args.pcg)
                 save_state(args.state, B, eps, meta)
             else:

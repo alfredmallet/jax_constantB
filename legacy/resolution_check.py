@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-resolution_check.py -- convergence-with-resolution study of a saved
-constantB_tools state (Squire & Mallet 2022 style: plot key quantities vs
-grid size to demonstrate the solution is resolved and not an artifact).
-Thin driver over the `constantB` package.
+resolution_check.py (JAX port) -- convergence-with-resolution study of a
+saved constantB_tools state (Squire & Mallet 2022 style: plot key quantities
+vs grid size to demonstrate the solution is resolved and not an artifact).
+
+This is a COPY of ../resolution_check.py, re-pointed at jax_constantB's
+jax-backed Solver/zero_pad/carrier/load_state (see constantB_tools.py's
+module docstring for what is and isn't jit-compiled). Logic is otherwise
+unchanged.
 
 For each grid in GRIDS the script:
   1. spectrally interpolates (zero-pads) the state to that grid -- exact for
      the retained modes, so the initial residual measured there is the HONEST
      (continuum) residual of the incoming solution;
-  2. re-polishes with minimum-norm Gauss-Newton until the residual converges
-     (or the sweep budget is exhausted -- increase SWEEPS/CGIT if the last
-     grids have not plateaued);
+  2. re-polishes with minimum-norm Gauss-Newton (jit-compiled GN/CG solve)
+     until the residual converges (or the sweep budget is exhausted --
+     increase SWEEPS/CGIT if the last grids have not plateaued);
   3. records: max | |B|-1 |, max |div B|, max |grad B| (Frobenius), max
      deflection from the mean field, and the reversal volume fraction.
 
@@ -21,33 +25,31 @@ max|grad B| with N that does not converge would be the sharpening signature
 discussed in the paper (Sec. 7.6) -- interesting rather than merely bad.
 
 DEALIAS (module constant below). With DEALIAS=True the study polishes with
-the Galerkin (2/3-rule) solve instead of plain collocation, and each row
-additionally records `tail_rms`/`tail_max` -- the discarded-band content of
-|B|^2-1 (`Solver.tail_norm`), which for a retained-band B equals the TRUE
-continuum spectral tail by power-preserving alias folding. This single-grid
-diagnostic is the primary regularity check in dealias mode (spectral decay
-of the tail vs N => smooth branch; algebraic decay => a Hoelder exponent)
-and largely replaces the cross-grid polish loop that collocation mode relies
-on for resolution honesty; the zero-pad incoming-residual print above is
-retained as a cross-check either way. IMPORTANT: the CSV schema differs
-between DEALIAS=True/False runs (extra tail_rms/tail_max columns) --
-CSV_NAME below picks a distinct filename automatically so old and new runs
-never collide mid-resume.
+the Galerkin (2/3-rule) solve (see constantB_tools.py's module docstring and
+`Solver`) instead of plain collocation, and each row additionally records
+`tail_rms`/`tail_max` -- the discarded-band content of |B|^2-1
+(`Solver.tail_norm`), which for a retained-band B equals the TRUE continuum
+spectral tail by power-preserving alias folding. This single-grid diagnostic
+is the primary regularity check in dealias mode (spectral decay of the tail
+vs N => smooth branch; algebraic decay => a Hoelder exponent) and largely
+replaces the cross-grid polish loop that collocation mode relies on for
+resolution honesty; the zero-pad incoming-residual print above is retained
+as a cross-check either way. IMPORTANT: the CSV schema differs between
+DEALIAS=True/False runs (extra tail_rms/tail_max columns) -- CSV_NAME below
+picks a distinct filename automatically so old and new runs never collide
+mid-resume.
 
 Intended for the eps=0.98 switchback state:
     python3 resolution_check.py mlstate_fine.npz
-Runtime warning: this can take a while at the largest default grid
-(96x96x192) -- the first call per grid pays a one-time XLA compilation cost,
-then each GN/CG solve runs as a single compiled program. Edit
-GRIDS/SWEEPS/CGIT to taste. Results are appended to CSV_NAME (see below) so
-the run can be interrupted and resumed.
+Runtime warning: even with the jit-compiled solve this can take a while at
+the largest default grid (96x96x192) -- the first call per grid pays a one-
+time XLA compilation cost, then each GN/CG solve runs as a single compiled
+program. Edit GRIDS/SWEEPS/CGIT to taste. Results are appended to
+CSV_NAME (see below) so the run can be interrupted and resumed.
 """
 import sys, time, csv, os
 import numpy as np
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from constantB import (Solver, zero_pad, carrier, load_state,
-                       numpy_wavenumbers, numpy_dif)
+from constantB_tools import Solver, zero_pad, carrier, load_state, numpy_wavenumbers, numpy_dif
 
 GRIDS   = [(48, 48, 96), (64, 64, 128), (96, 96, 192)]
 PCG     = True        # spectral preconditioner: essential at large N, where the
