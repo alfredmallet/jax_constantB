@@ -96,7 +96,9 @@ def plot_3d(B, meta, out, iso_alpha=0.55, annotate_reversed=False):
         ax2.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2],
                          color='crimson', alpha=iso_alpha, lw=0)
         ax2.set_title(iso_title, fontsize=10)
-    except ImportError:
+    except Exception:      # ImportError, or a binary-incompatible skimage
+                           # build raising ValueError at import time
+
         idx = np.argwhere(Bpar < 0)
         ax2.scatter(idx[:, 0]*L/shape[0], idx[:, 1]*L/shape[1], idx[:, 2]*L/shape[2],
                     s=2, c='crimson', alpha=0.4)
