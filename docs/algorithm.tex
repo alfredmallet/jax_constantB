@@ -761,10 +761,13 @@ injection of the continuation driver (Section~\ref{sec:driver}), never through
 the solve. The mean-field freeze of Corollary~\ref{cor:mean} is the same
 mechanism with $\kk=0$.
 
-\subsection{Implementation (v2): bordered energy rows}
+\subsection{Implementation (v3): bordered energy rows}\label{sec:erows}
 
 Freezing fixes the pinned \emph{coefficients}; the scientifically meaningful
 constraint is on the pinned \emph{energies}, which leaves the phases free.
+This is what the code does (\texttt{MuSolver(\dots,\,pins=)} and
+\texttt{gn(\dots,\,pin\_targets=)}); the freeze of the previous subsection is
+retained only to reproduce the measurement of Table~\ref{tab:pins}.
 Define, for a conjugate pair $\{\pm\kk_j\}$ with spectral projector
 $\Pl_{\kk_j}$ (a self-adjoint projection on real fields),
 \begin{equation}\label{eq:erows}
@@ -803,6 +806,79 @@ positive. One may therefore either run CG on the whole $(\mu,\nu)$ vector, or
 eliminate $\nu=D^{-1}(\Delta e-C^{\!\top}\mu)$ and run CG on the rank-$m$
 modified operator $\Aop-CD^{-1}C^{\!\top}$, each of whose applications costs
 $m$ inner products beyond \eqref{eq:step-G}.
+
+\paragraph{As implemented.} The code takes the first option: one
+preconditioned CG on the whole $(\mu,\nu)$ vector, with the $\mu$-block
+preconditioner \eqref{eq:pc} unchanged and the $\nu$-block divided by
+$D_{jj}$, evaluated as $\langle\gv_j,\Wm^{-2}\Pl\Tr\gv_j\rangle$ so that a
+pin whose bin some other mask kills cannot divide by zero. One application of
+the bordered operator costs one application of \eqref{eq:step-G} plus $m$
+inner products, as advertised: the direction
+$\mathsf D=\Wm^{-2}\Pl\Trr(\mu\B+\sum_j\nu_j\gv_j)$ is formed once and then
+paired against $\B$ and against each $\gv_j$. Three implementation points
+carry the measured behaviour.
+
+\emph{Re-linearisation.} $\gv_j$, $e_j$ and $D_{jj}$ are rebuilt from the
+current $\B$ at \emph{every} sweep, not once per solve. The pin residual then
+converges quadratically alongside $\Tr q$ (measured: $10^{-13}$ relative
+within three or four sweeps, and $\sim10^{-14}$ throughout a continuation)
+instead of lagging it.
+
+\emph{Discrete inner product.} Both borders use the same sum over grid points
+as the CG, so on an $N_x\!\times\!N_y\!\times\!N_z$ grid the implemented pin
+functional is $\mathrm{vol}\cdot e_j$ with $\mathrm{vol}=N_xN_yN_z$; targets
+are quoted in those units. This is not cosmetic: a volume mean in the rows
+against a sum in the CG destroys the symmetry of \eqref{eq:bordered} and the
+pins stop converging. With the convention consistent, the discrete bordered
+operator is symmetric to $10^{-14}$ relative, with pins alone, with frozen
+bins alone, and with both.
+
+\emph{The $k_z=0$ partner rule} of the previous subsection applies verbatim to
+the pin selectors: a row that selects one partner of a conjugate pair and not
+the other measures half the energy and steers the wrong quantity.
+
+\paragraph{Measured: energy rows cost what freezing does not.} A frozen bin
+cannot participate in cancelling the residual its own presence creates, and
+the solver buys feasibility with a spectral cascade. Table~\ref{tab:pins}
+compares the two implementations along one continuation (a random seed,
+$36^2\times72$, three top modes pinned, the same $\delta\epsilon$ schedule),
+against the unpinned control.
+
+\begin{table}[htbp]
+\centering
+\caption{Frozen coefficients versus bordered energy rows on the same
+carrier-free path (random seed, $36^2\times72$, $m=3$ non-coplanar pins,
+Galerkin $s=0$). ``tail'' is the Galerkin tail rms, the honest unresolved
+burden; $\max|\nabla\B|_F$ is the driver's gradient monitor. The energy rows
+land on the unpinned control; the freeze does not.}
+\label{tab:pins}
+\medskip
+\small
+\begin{tabular}{lcccc}
+\toprule
+pinning & $\epsilon$ & $\max|\nabla\B|_F$ & tail & pin rel.\ error\\
+\midrule
+frozen coefficients \eqref{eq:step-G} & $0.269$ & $2.45$ & $1.2\times10^{-3}$ & ---\\
+none (control) & $0.269$ & $0.80$ & $1.7\times10^{-6}$ & ---\\
+energy rows \eqref{eq:bordered} & $0.290$ & $0.87$ & $3.8\times10^{-6}$ & $8\times10^{-14}$\\
+energy rows \eqref{eq:bordered} & $0.356$ & $1.11$ & $8.3\times10^{-6}$ & $1\times10^{-13}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{remark}[no activation threshold]\label{rem:pinstart}
+The freeze needs one: at $\B\approx\bar\B$ the quadratic row reads
+$\Tr(\bar\B\cdot\dd)$, so a residual component in a frozen bin can only be
+cancelled by $\dd$ in that same bin, and freezing from $\epsilon=0$ makes the
+first steps infeasible. An energy row has no such obstruction --- it is a
+single scalar equation whose target starts at zero and grows like
+$\epsilon^2$, which the seed injection itself satisfies to leading order.
+Continuation with the rows active from $\epsilon=0$ is therefore the default,
+and the driver offers no delayed activation for them. The natural schedule is
+$c_j(\epsilon)=\epsilon^2e_j(\bb)$ with $\bb$ the seed: the energy the
+linearised push would put in pin $j$. Because $e_j$ is a grid sum, it must be
+recomputed from the seed on each rung of the resolution ladder.
+\end{remark}
 
 \section{Smoothest-state descent (experimental)}\label{sec:descent}
 

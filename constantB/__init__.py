@@ -28,6 +28,7 @@ v2, carrier-free stack (docs/SPEC_v2.md, docs/algorithm.tex):
     seeds_free   carrier-free seeds: curl of arbitrary/blob/random potentials
     spectra      shell & axis spectra, exact q-spectrum, 3D-ness monitor
     descent      EXPERIMENTAL smoothest-state SQP descent (not re-exported)
+    poincare     jax field-line tracer + Poincare puncture maps (v3)
 
 Float64 is REQUIRED (GN tolerance 1e-10, CG stop 1e-26 relative): x64 mode is
 enabled here, before anything else touches jax.  Do not import jax-dependent
@@ -46,6 +47,8 @@ from .seeds_free import (from_potential, blob, random_seed, make_seed,
                          top_modes)
 from .spectra import (shell_spectrum, axis_spectra, q_spectrum,
                       kspace_inertia, local_slope, exp_kappa, plot_spectra)
+from .poincare import (trace, trace_punctures, punctures, rotation_number,
+                       nn_spread)
 from .seeds import carrier, seed_mode, build_seed, blob_seed
 from .state_io import save_state, load_state, meta_args, rebuild_seed
 from .series import series, domb_sykes, pade_poles
@@ -60,6 +63,7 @@ __all__ = [
     "from_potential", "blob", "random_seed", "make_seed", "top_modes",
     "shell_spectrum", "axis_spectra", "q_spectrum", "kspace_inertia",
     "local_slope", "exp_kappa", "plot_spectra",
+    "trace", "trace_punctures", "punctures", "rotation_number", "nn_spread",
     # descent (EXPERIMENTAL) deliberately not re-exported: import
     # constantB.descent explicitly.
     "carrier", "seed_mode", "build_seed", "rebuild_seed", "blob_seed",

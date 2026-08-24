@@ -12,7 +12,8 @@ constant-field-strength (|B| = 1), divergence-free magnetic fields.
       solver_mu.py        mu-only exact-Galerkin minimum-norm GN (v2 hot path)
       seeds_free.py       carrier-free seeds: curl of arbitrary/blob/random potentials
       spectra.py          shell & axis spectra, exact q-spectrum, 3D-ness monitor
-      descent.py          EXPERIMENTAL smoothest-state SQP descent + energy pins
+      descent.py          EXPERIMENTAL smoothest-state SQP descent (solver's energy pins)
+      poincare.py         jax field-line tracer + Poincare puncture maps (v3)
       seeds.py            1D carrier, linearised 3D seed modes, blob seed
       state_io.py         .npz state files (compatible with the numpy reference)
       series.py           perturbation series, Domb-Sykes, Pade (host numpy)
@@ -29,7 +30,10 @@ constant-field-strength (|B| = 1), divergence-free magnetic fields.
     kaggle_grow.ipynb     P100 driver notebook for grow.py
     tests/parity_check.py 3-way parity: numpy reference / legacy jax / package
     tests/test_v2.py      v2 gates: observable parity, invariants, end-to-end grow
+    tests/test_v3.py      v3 gates: energy pins (incl. cascade reference), Poincare
+    poincare_map.py       puncture-map CLI: state -> section figure + .npz
     docs/SPEC_v2.md       binding v2 build spec
+    docs/SPEC_v3.md       binding v3 build spec (energy pins + Poincare map)
     docs/algorithm.tex    the v2 algorithm note (pdflatex)
     legacy/               pre-rewrite single-file versions (frozen)
     DESIGN.md             numerical design rationale -- READ THIS FIRST

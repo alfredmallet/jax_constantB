@@ -23,8 +23,23 @@ residual still above --res-ok after `sweeps` means the step is genuinely bad,
 so the step is rejected and d_eps halved.
 
     python3 grow.py --seed random --key 3 --eps-max 2.0
-    python3 grow.py --seed blob --freeze-top 3 --fix-mean --Bbar 0 0 0.9
+    python3 grow.py --seed random --key 3 --pin-top 3        # 3D anchored
     python3 grow.py --plot
+
+PINS (v3, --pin-top m).  The seed's m dominant modes are held at the ENERGY
+schedule c_j(eps) = eps^2 e_j(seed) -- the amplitude the linearised push would
+give them -- by the solver's bordered energy rows, phases left free.  Three
+non-coplanar pins exclude 1D and planar states outright, which is what makes a
+"genuinely 3D" claim about a grown state provable rather than hopeful.  The
+older --freeze-top holds the COEFFICIENTS instead and is deprecated for
+growth: a frozen bin cannot help cancel the residual it creates, and the
+solver pays for that with a cascade (36^2x72, eps ~ 0.27: maxgrad 2.45 and
+Galerkin tail 1.2e-3 frozen, against 0.80 / 1.7e-6 unpinned and 0.87 / 3.8e-6
+with energy pins at the slightly larger eps = 0.290).
+
+CSV SCHEMA (v3): a `pin_err` column, max_j |e_j/c_j - 1| (0.0 with no pins),
+now trails every row.  Old CSVs therefore do not match; the fresh-state =>
+fresh-CSV guard below already refuses to append to one.
 
 PER STEP: push B + de*seed, re-converge, log a CSV row, then adapt -- refine
 the grid (ascending x1.5 ladder, zero-pad, re-polish) when the Galerkin tail or
@@ -32,7 +47,9 @@ the retained-band edge content gets too big; halve de on a rejected step
 (underflow => FOLD CANDIDATE); regrow de after two clean accepts.
 
 RESUMABLE: the state .npz carries B, eps and the full meta (seed spec, smooth,
-fix_mean, freeze list), so a resumed run needs none of the seed CLI flags again
+fix_mean, freeze and pin lists -- the pin TARGETS are not stored, they are
+recomputed from the rebuilt seed on whatever grid the run resumes at, because
+they are sums and not means), so a resumed run needs no seed CLI flags again
 -- they are ignored on resume, and the run continues on whatever grid the state
 was left at.  Snapshots grow_epsX.XX.npz are written beside --state.
 """
@@ -56,7 +73,13 @@ from constantB.spectra import kspace_inertia
 
 CSV_FIELDS = ["eps", "de", "grid", "res", "cg", "minutes", "maxgrad", "Bbar",
               "maxdefl", "vol_rev", "gal_tail_rms", "gal_tail_max", "edge",
-              "fluct_rms", "drift", "lam21", "lam31"]
+              "fluct_rms", "drift", "lam21", "lam31", "pin_err"]
+
+# Largest relative pin error a step may leave behind.  The bordered rows are
+# re-linearised every sweep, so the pin residual converges quadratically and
+# lands at ~1e-13; anything above this means the sweep budget ran out, and the
+# step is rejected exactly like a missed --res-ok.
+_PIN_ERR_MAX = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +126,23 @@ def _build_seed(args, S):
         a = np.stack([np.asarray(zero_pad(a[i], tuple(S.shape)))
                       for i in range(3)])
     return from_potential(a, S)
+
+
+def _pin_schedule(S, seed):
+    """e_j(seed) for the solver's pins, on THIS solver's grid (SUM units).
+
+    The targets are c_j(eps) = eps^2 e_j(seed): the energy the linearised push
+    B = Bbar + eps*seed puts in pin j, so the schedule is exactly "keep the
+    seed's own 3D anchor growing at its natural rate" and needs no activation
+    threshold -- unlike a coefficient freeze it is satisfiable from eps = 0.
+
+    RECOMPUTED ON EVERY RUNG, never carried across grids: `pinned_energies` is
+    a SUM over grid points (e = vol * <|P_j B|^2>, the solver's CG inner
+    product), so the same continuum seed has targets a factor vol_new/vol_old
+    apart on two rungs of the ladder.  Both sides of e_j/c_j scale with vol,
+    so the LOGGED pin_err is grid independent; the targets themselves are not.
+    """
+    return S.pinned_energies(np.asarray(seed, float))
 
 
 def _diagnostics(S, B):
@@ -183,14 +223,20 @@ def run(args):
                   for t in np.asarray(meta["freeze"], int).reshape(-1, 3)]
         freeze_after = (float(meta["freeze_after"])
                         if "freeze_after" in meta else 0.0)
+        # Only the pin TRIPLES are restored: e_j(seed) is recomputed below on
+        # this rung's grid, because it is a sum, not a mean (_pin_schedule).
+        pins = [tuple(int(v) for v in t)
+                for t in np.asarray(meta["pins"], int).reshape(-1, 3)] \
+            if "pins" in meta else []
         B = np.asarray(B, float)
         print(f"resuming: eps={eps:.3f} grid={grid} seed={meta['seed_kind']} "
-              f"smooth={smooth} fix_mean={fix_mean} freeze={freeze}")
-        print("  (seed/smooth/freeze come from the state; those CLI flags are "
-              "ignored on resume)")
+              f"smooth={smooth} fix_mean={fix_mean} freeze={freeze} "
+              f"pins={pins}")
+        print("  (seed/smooth/freeze/pins come from the state; those CLI flags "
+              "are ignored on resume)")
         freeze_on = eps >= freeze_after
         S = MuSolver(grid, smooth=smooth, fix_mean=fix_mean,
-                     freeze=(freeze if freeze_on else []))
+                     freeze=(freeze if freeze_on else []), pins=pins)
         de0 = float(meta["de"]) if "de" in meta else args.de
         streak0 = int(meta["streak"]) if "streak" in meta else 0
     else:
@@ -214,6 +260,13 @@ def run(args):
                   "(project rule: fresh state => fresh CSV). Move it aside or "
                   "pass a new --csv.")
             return 2
+        if args.freeze_top > 0 and args.pin_top > 0:
+            print("ERROR: --freeze-top and --pin-top both requested.  They "
+                  "would select the SAME top modes, and a frozen bin's energy "
+                  "cannot be steered (the solver rejects the overlap).")
+            print("  Use --pin-top for growth; --freeze-top is kept only to "
+                  "reproduce the v1 cascade measurement.")
+            return 2
         grid = tuple(args.grid0)
         smooth, fix_mean = float(args.smooth), bool(args.fix_mean)
         de0, streak0 = args.de, 0
@@ -221,8 +274,23 @@ def run(args):
                                                  fix_mean=fix_mean))
         freeze_after = max(float(args.freeze_after), 0.0)
         meta.update(Bbar=Bbar0, smooth=smooth, fix_mean=fix_mean,
-                    freeze=np.zeros((0, 3), int), freeze_after=freeze_after)
-        freeze = []
+                    freeze=np.zeros((0, 3), int), freeze_after=freeze_after,
+                    pins=np.zeros((0, 3), int))
+        freeze, pins = [], []
+        if args.pin_top > 0:
+            pins = [tuple(int(v) for v in t)
+                    for t in top_modes(seed0, args.pin_top)]
+            meta["pins"] = np.array(pins, int).reshape(-1, 3)
+            nc = bool(noncoplanar(pins))
+            print("energy-pinning the seed's top modes: "
+                  + ", ".join(str(t) for t in pins))
+            print(f"  noncoplanar(pins) = {nc}"
+                  + ("   [Lemma: nonzero energy at three non-coplanar "
+                     "wavevectors excludes 1D and planar states]" if nc else
+                     "   [WARNING: every triple is coplanar -- such a pin set "
+                     "cannot by itself force 3D structure]"))
+            print("  schedule c_j(eps) = eps^2 e_j(seed), rebuilt on every "
+                  "grid rung (SUM units); phases stay free.")
         if args.freeze_top > 0:
             freeze = [tuple(int(v) for v in t)
                       for t in top_modes(seed0, args.freeze_top)]
@@ -239,7 +307,7 @@ def run(args):
                       "uniform start a frozen residual bin is uncancellable)")
         freeze_on = freeze_after <= 0
         S = MuSolver(grid, smooth=smooth, fix_mean=fix_mean,
-                     freeze=(freeze if freeze_on else []))
+                     freeze=(freeze if freeze_on else []), pins=pins)
         B = np.zeros((3,) + grid) + Bbar0[:, None, None, None]
         B = np.asarray(S.project(B))          # gn never fixes div: project once
         eps = 0.0
@@ -257,22 +325,38 @@ def run(args):
             print("  makes this start HARDER, not easier.")
 
     seed = np.asarray(make_seed(meta, S), float)
+    e_seed = _pin_schedule(S, seed)
     grids = _ladder(B.shape[1:], tuple(args.grid_max))
     de, streak, stop = de0, streak0, ""
     fresh = not os.path.exists(args.csv)
+    if not fresh:                          # review m10: schema drift warning
+        with open(args.csv) as f:
+            hdr = f.readline().strip().split(",")
+        if hdr and hdr != CSV_FIELDS:
+            print(f"WARNING: {args.csv} header has {len(hdr)} fields, current "
+                  f"schema has {len(CSV_FIELDS)} (pin_err added in v3); rows "
+                  "will not align -- start a fresh --csv for clean analysis.")
     snap_next = (int(eps / args.snap_de) + 1) * args.snap_de
     t_start = time.time()
 
     while eps < args.eps_max and time.time() - t_start < args.max_seconds:
         t0 = time.time()
         Bprev = np.array(B)                   # the previous ACCEPTED state
+        # Targets for the eps this step is REACHING (traced: no recompile when
+        # a rejection halves de and the schedule value changes).
+        tgt = (eps + de) ** 2 * e_seed if pins else None
         Btry, res, ci = S.gn(np.asarray(B) + de * seed, sweeps=args.sweeps,
-                             cgit=args.cgit, tol=args.res_ok * 1e-2)
-        if res > args.res_ok:
+                             cgit=args.cgit, tol=args.res_ok * 1e-2,
+                             pin_targets=tgt)
+        pin_err = S.pin_error(Btry, tgt, relative=True) if pins else 0.0
+        if res > args.res_ok or pin_err > _PIN_ERR_MAX:
             # No salvage: mu-form GN is quadratically convergent, so a residual
             # still above res-ok after `sweeps` means the step is genuinely bad.
+            # A missed PIN is equally disqualifying: the anchor would no longer
+            # be where the schedule says, and "genuinely 3D" rests on that.
             B, de, streak = Bprev, de * 0.5, 0
-            print(f"  [step rejected: res {res:.1e}; d_eps -> {de:.5f}]")
+            print(f"  [step rejected: res {res:.1e} pin_err {pin_err:.1e}; "
+                  f"d_eps -> {de:.5f}]")
             if de < args.de_min:
                 stop = "fold"
                 break
@@ -281,13 +365,13 @@ def run(args):
         if freeze and not freeze_on and eps >= freeze_after:
             freeze_on = True
             S = MuSolver(B.shape[1:], smooth=smooth, fix_mean=fix_mean,
-                         freeze=freeze)
-            print(f"   [pins active from eps={eps:.3f}: "
+                         freeze=freeze, pins=pins)
+            print(f"   [freeze active from eps={eps:.3f}: "
                   + ", ".join(str(t) for t in freeze) + "]")
         d = _diagnostics(S, B)
         row = dict(eps=round(eps, 4), de=de, grid=str(tuple(B.shape[1:])),
                    res=res, cg=ci, minutes=round((time.time() - t0) / 60, 3),
-                   **d)
+                   pin_err=pin_err, **d)
         meta["de"], meta["streak"] = de, streak
         save_state(args.state, B, eps, meta)    # state BEFORE the CSV row: a
         _write_row(args.csv, row, fresh)        # kill between the two loses a
@@ -295,7 +379,8 @@ def run(args):
         print(f"eps={eps:.3f} grid={tuple(B.shape[1:])} res={res:.1e} "
               f"maxgrad={d['maxgrad']:.2f} drift={d['drift']:.4f} "
               f"defl={d['maxdefl']:.1f} gtail={d['gal_tail_rms']:.1e} "
-              f"edge={d['edge']:.1e} lam={d['lam21']:.2f}/{d['lam31']:.2f}")
+              f"edge={d['edge']:.1e} lam={d['lam21']:.2f}/{d['lam31']:.2f}"
+              + (f" pin={pin_err:.1e}" if pins else ""))
         if eps >= snap_next - 1e-9:
             save_state(_snap_name(args.state, eps), B, eps, meta)
             snap_next += args.snap_de
@@ -310,21 +395,32 @@ def run(args):
             old, new = tuple(B.shape[1:]), grids[cur + 1]
             Bf = np.stack([np.asarray(zero_pad(B[i], new)) for i in range(3)])
             S = MuSolver(new, smooth=smooth, fix_mean=fix_mean,
-                         freeze=(freeze if freeze_on else []))
+                         freeze=(freeze if freeze_on else []), pins=pins)
             Bf = S.project(Bf)
+            # The seed (and with it the pin schedule) is rebuilt BEFORE the
+            # polish: e_j(seed) is a grid-dependent sum, so the targets the
+            # polish must hold are this rung's, never the previous rung's.
+            seed = np.asarray(make_seed(meta, S), float)
+            e_seed = _pin_schedule(S, seed)
+            tgt = eps ** 2 * e_seed if pins else None
             rin = max(float(np.abs(np.asarray(r)).max()) for r in S.residual(Bf))
             Bp, res2, _ = S.gn(Bf, sweeps=args.sweeps + 4, cgit=args.cgit,
-                               tol=args.res_ok * 1e-2)
+                               tol=args.res_ok * 1e-2, pin_targets=tgt)
             B = np.asarray(Bp)
+            pe2 = S.pin_error(B, tgt, relative=True) if pins else 0.0
             print(f"   [refined {old} -> {new}; incoming honest residual "
-                  f"{rin:.1e}; polished to {res2:.1e}]")
+                  f"{rin:.1e}; polished to {res2:.1e}"
+                  + (f"; pin_err {pe2:.1e}]" if pins else "]"))
             if res2 > args.res_ok:
                 print(f"   *** WARNING: post-refinement residual {res2:.1e} "
                       f"EXCEEDS --res-ok {args.res_ok:.1e}: the state on the "
                       "finer grid is NOT converged and")
                 print("   *** every diagnostic from here on is suspect.  "
                       "Raise --sweeps (not --de) and rerun this rung.")
-            seed = np.asarray(make_seed(meta, S), float)
+            if pe2 > _PIN_ERR_MAX:
+                print(f"   *** WARNING: post-refinement pin_err {pe2:.1e} "
+                      "exceeds the step tolerance: the 3D anchor is off its "
+                      "schedule on the new rung.")
             streak = 0                          # algorithm.tex Alg. 1: c <- 0
             meta["de"], meta["streak"] = de, streak
             save_state(args.state, B, eps, meta)
@@ -339,7 +435,7 @@ def run(args):
         print("  |Bbar| < 1 is just the off-manifold start.  There is no "
               "carrier to blame: a stall eps that")
         print("  survives every reroute (--grid-max, --smooth, --key, "
-              "--freeze-top) is a true obstruction.")
+              "--pin-top) is a true obstruction.")
     elif stop == "sharpening":
         print("STOP: tails exceed the limit at the largest allowed grid.  "
               "SHARPENING -- the state is leaving")
@@ -348,7 +444,7 @@ def run(args):
         print("  path alone: if the same eps recurs for larger --grid-max it "
               "marks genuine gradient blow-up")
         print("  of THIS path (retry --smooth > 0, another --key, or a "
-              "--freeze-top set first).")
+              "--pin-top set first).")
     print(f"done: eps={eps:.3f} grid={tuple(np.shape(B)[1:])} "
           f"({(time.time() - t_start) / 60:.1f} min)")
     return 0
@@ -427,13 +523,27 @@ def build_parser():
     p.add_argument("--edge-max", type=float, default=1e-5)
     p.add_argument("--smooth", type=float, default=0.0)
     p.add_argument("--fix-mean", action="store_true")
-    p.add_argument("--freeze-top", type=int, default=0)
+    p.add_argument("--pin-top", type=int, default=0,
+                   help="hold the ENERGY of the seed's m dominant modes on the "
+                        "schedule c_j(eps) = eps^2 e_j(seed) (bordered energy "
+                        "rows; phases free). Three non-coplanar pins exclude "
+                        "1D and planar states outright. No activation "
+                        "threshold is needed or offered: an energy row is "
+                        "satisfiable from eps = 0. Adds the pin_err column.")
+    p.add_argument("--freeze-top", type=int, default=0,
+                   help="DEPRECATED for growth (use --pin-top): freezes the "
+                        "seed's m top COEFFICIENTS. A frozen bin cannot help "
+                        "cancel the residual it creates, so the solver pays "
+                        "with a cascade -- 36^2x72 at eps ~ 0.27: maxgrad 2.45 "
+                        "/ tail 1.2e-3 frozen vs 0.80 / 1.7e-6 unpinned. Kept "
+                        "to reproduce that measurement.")
     p.add_argument("--freeze-after", type=float, default=0.2,
-                   help="activate --freeze-top pins only once eps >= this. "
-                        "Near the uniform start B.dB ~ Bbar.dB, so a residual "
-                        "bin at a frozen k can ONLY be cancelled by dB at that "
-                        "same bin: freezing from eps=0 makes the first steps "
-                        "infeasible (observed). 0 freezes from the start.")
+                   help="activate the --freeze-top freeze only once eps >= "
+                        "this. Near the uniform start B.dB ~ Bbar.dB, so a "
+                        "residual bin at a frozen k can ONLY be cancelled by "
+                        "dB at that same bin: freezing from eps=0 makes the "
+                        "first steps infeasible (observed). 0 freezes from the "
+                        "start. Energy pins need no such threshold.")
     p.add_argument("--snap-de", type=float, default=0.25)
     p.add_argument("--max-seconds", type=float, default=1e9)
     p.add_argument("--plot", action="store_true")

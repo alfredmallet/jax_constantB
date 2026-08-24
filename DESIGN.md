@@ -206,3 +206,121 @@ SQP descent in `descent.py`.
 `Solver.gn`'s donate_argnums deletes the caller's jax array (silent
 footgun; legacy drivers survive only because they pass numpy). v2 never
 donates; the copy cost is negligible against a multi-sweep solve.
+
+## v3: energy pins and the Poincare map (2026-08-24)
+
+New: bordered energy-pin rows in `solver_mu.py`, `poincare.py` +
+`poincare_map.py`, `--pin-top` in `grow.py`, `tests/test_v3.py`; binding
+spec `docs/SPEC_v3.md`, algorithm note section 7.2.
+
+### Energy pins beat frozen coefficients
+
+v1 `freeze` holds a bin's VALUE. That is the wrong instrument for growth: the
+held bin cannot participate in cancelling the residual its own presence
+creates, so the solver buys feasibility with a spectral cascade. Measured on
+one seed and path (36^2x72, random key 1, three top modes):
+
+    v1 freeze,     eps 0.269:  maxgrad 2.45   Galerkin tail 1.2e-3
+    unpinned,      eps 0.269:  maxgrad 0.80   tail 1.7e-6
+    energy pins,   eps 0.290:  maxgrad 0.87   tail 3.8e-6   pin rel err 8e-14
+    energy pins,   eps 0.356:  maxgrad 1.11   tail 8.3e-6
+
+i.e. the pins cost essentially nothing while the freeze costs three orders of
+magnitude of tail. (maxgrad here is grow.py's max |grad B|_F; test_v2's
+max_ij |d_j B_i| is ~1.4x smaller on these states.) The energy row
+e_j(B) = 0.25 sum_x |G_j|^2 with G_j = 2 P_{k_j} B leaves the PHASE free,
+which is the whole difference: the mode keeps its prescribed amplitude and
+the solver still gets to choose where to put it. Three non-coplanar pins with
+nonzero energy exclude 1D and planar states outright (algorithm.tex
+Lemma 7.2), so "genuinely 3D" becomes provable rather than hopeful.
+
+### SUM units are load-bearing
+
+e_j is a SUM over grid points, not a volume mean:
+
+    e_j = sum_x |P_j B|^2 = vol * < |P_j B|^2 >,     vol = Nx*Ny*Nz.
+
+That is the same inner product the CG uses (`.sum()`), so the pin rows, the
+right-hand side and the nu-block preconditioner are mutually consistent and
+the bordered operator is exactly symmetric (tests/test_v3.py case 2:
+1e-14 relative defect). Mixing a volume mean into any one of them was the
+prototype's ONE bug and it does not announce itself as a units error -- it
+appears as pins that converge slowly or not at all. Two consequences the
+drivers must respect:
+
+  - targets handed to `gn(pin_targets=...)` are in SUM units;
+  - they are GRID DEPENDENT. `grow.py` recomputes c_j(eps) = eps^2 e_j(seed)
+    from the rebuilt seed on every ladder rung and never carries a schedule
+    across a refinement -- carrying one from 16^2x32 to 24^2x48 would be
+    wrong by vol_new/vol_old = 3.375. Both sides of the logged ratio
+    e_j/c_j scale with vol, so `pin_err` itself is grid independent
+    (measured 1e-13 on both sides of a refinement; test_v3 case 9).
+
+### No activation threshold, and no --pin-after
+
+`--freeze-top` needs `--freeze-after` (default 0.2) because near the uniform
+start B.dB ~ Bbar.dB, so a residual bin at a frozen k is uncancellable and the
+first steps are infeasible. An energy row has no such trap: it is one scalar
+equation whose target starts at zero and grows as eps^2, satisfied by the
+push itself to leading order. Pinned growth from eps = 0 was validated
+(8 steps, pin residual 1e-13 throughout), so no `--pin-after` exists. The
+bordered rows are re-linearised every sweep, which is what makes the pin
+residual converge quadratically with the q-residual rather than lagging it.
+
+`--freeze-top` stays, documented as deprecated for growth, because it is how
+the cascade above was measured and it is the cheaper instrument when a
+coefficient (not an energy) is genuinely what one wants held.
+
+### CSV schema change
+
+`grow.py` rows gain a trailing `pin_err` column (max_j |e_j/c_j - 1|, 0.0
+without pins). v2 CSVs are therefore not appendable; the existing
+fresh-state-implies-fresh-CSV guard already refuses to mix them.
+
+### descent.py rebuilt on the solver's border
+
+The experimental SQP descent no longer carries its own bordered machinery. It
+imports the solver's operator, pin selectors and preconditioner and solves the
+SAME bordered system with the SQP right-hand side (Tq + 1, 2 e_j), then
+retracts with a PINNED `gn` whose targets are the entry energies -- so the
+pinned energies come back exactly (1e-13) instead of to the O(alpha^2)
+accuracy of the tangency, and there is exactly one definition of which bins a
+pin owns.
+
+### Poincare puncture maps
+
+`poincare.trace` integrates dr/ds = B/|B| in ARC LENGTH by RK4, vmapped over
+lines and `lax.scan`ned over steps, with the field trilinearly interpolated on
+a `refine`x spectrally zero-padded grid. Positions stay unwrapped, as in
+legacy `fieldlines.trace_lines` (untouched). Two error scales, both worth
+stating on any figure:
+
+  - interpolation, O((dx/refine)^2) -- THE dominant error, and the only one
+    worth spending on: a 2x pad costs 8x memory and divides the error by 4;
+  - integration. RK4's formal O(h^4) is NOT observed and cannot be: the
+    trilinear interpolant is C^0, with a kink at every cell face, so a step
+    crossing a face carries O(h^2) local error and the measured order is
+    0.6-1.2 (test_v3 case 7). At h = 0.02 the integrator error is already
+    ~100x below the interpolation bound, so accuracy is bought with `refine`,
+    never with smaller h.
+
+Memory is the design constraint: 512 lines x 300 transits is ~1.5e5 steps, so
+`trace_punctures` carries the position through chunked scans, extracting each
+chunk's crossings on the host and dropping the positions (`trace`, which
+returns the whole trajectory, is for tests and short runs). Crossings are
+located by cubic interpolation in arc length through the four straddling
+samples -- linear interpolation would floor the accuracy at O(h^2) and become
+the bottleneck.
+
+Validation of the tracer is analytic where possible: for B = (a cos z,
+a sin z, c) the lines integrate in closed form and every puncture map is the
+IDENTITY, so the measured drift is pure error (1e-7, some 1e4 below the
+interpolation bound, because for that field the interpolated chord's
+DIRECTION error is third order and `bdir` normalises). On a real state the
+check is the drift theorem: a unit-speed volume-preserving flow has
+<dr/ds> = Bbar, so lines seeded uniformly in the VOLUME advance along Bbar by
+|Bbar| per unit arc -- measured 0.842987 vs 0.843098 (1.3e-4) on the s = 0,
+eps = 10.05 state. NOTE the projection: that state's mean field is tilted
+12.7 degrees (Bbar_x = -0.186), so the z-advance is Bbar_z = 0.8224, NOT
+|Bbar|; testing dz/ds against |Bbar| fails by 2.5% for a perfectly correct
+tracer.
