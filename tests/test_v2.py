@@ -356,7 +356,7 @@ def case8():
         S = MuSolver(tuple(B.shape[1:]))
         r = max(float(np.abs(np.asarray(x)).max()) for x in S.residual(B))
         report("final state still converged", r <= 1e-9, f"res={r:.2e}")
-        snaps = [f for f in os.listdir(td) if f.startswith("grow_eps")]
+        snaps = [f for f in os.listdir(td) if f.startswith("g_eps")]
         report("snapshots written beside --state", len(snaps) >= 1,
                f"{sorted(snaps)}")
 
