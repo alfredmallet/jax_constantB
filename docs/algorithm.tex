@@ -1,0 +1,1042 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{question}[theorem]{Open question}
+
+\setlength{\emergencystretch}{2em}
+
+\newcommand{\B}{\mathbf{B}}
+\newcommand{\bb}{\mathbf{b}}
+\newcommand{\dd}{\mathbf{d}}
+\newcommand{\A}{\mathbf{A}}
+\newcommand{\vv}{\mathbf{v}}
+\newcommand{\x}{\mathbf{x}}
+\newcommand{\kk}{\mathbf{k}}
+\newcommand{\gv}{\mathbf{g}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\T}{\mathbb{T}}
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\C}{\mathbb{C}}
+\newcommand{\Sph}{\mathbb{S}}
+\newcommand{\Tr}{\mathsf{T}}
+\newcommand{\Trr}{\mathsf{T}_3}
+\newcommand{\Pl}{\mathsf{P}}
+\newcommand{\Wm}{\mathsf{W}}
+\newcommand{\Zf}{\mathsf{Z}}
+\newcommand{\Aop}{\mathsf{A}}
+\newcommand{\Minv}{\mathsf{M}^{-1}}
+\newcommand{\dive}{\operatorname{div}}
+\newcommand{\curl}{\operatorname{curl}}
+\newcommand{\supp}{\operatorname{supp}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\rank}{\operatorname{rank}}
+
+\title{A minimum-norm Gauss--Newton method for carrier-free\\
+continuation of constant-$|\B|$ fields}
+\author{A.~Mallet\\
+\small Space Sciences Laboratory, University of California, Berkeley}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We document the algorithm behind the v2 (``carrier-free'') solver stack of the
+\texttt{jax\_constantB} package: a minimum-norm Gauss--Newton continuation for
+divergence-free unit vector fields on the periodic box, in which the
+divergence multiplier is eliminated analytically. The elimination reduces each
+sweep to a single scalar normal equation, which we show is exactly the
+minimum-norm correction expressed in vector-potential variables; it preserves
+$\nabla\cdot\B$ to round-off by construction, and its Galerkin (strict
+$2/3$-rule) discretisation has an \emph{exact} Jacobian, so that Newton's
+method converges quadratically with the explicitly computable constant
+$\tfrac12$. We derive the symbol of the resulting normal operator,
+$(1+k^2)^{-s}\sin^2\theta(\hat\kk,\B)$, which identifies the removable part
+of the conditioning (a diagonal preconditioner) and the intrinsic part
+(field-aligned near-null directions). We then give the constraints used to
+pin genuine three-dimensionality, an experimental descent that seeks the
+smoothest state at fixed pinned energies, and the continuation driver.
+Measured convergence, iteration counts and timings are collected in
+Table~\ref{tab:measured}.
+\end{abstract}
+
+\section{The problem}\label{sec:problem}
+
+\subsection{Physical motivation}
+
+A magnetic field of constant magnitude and vanishing divergence, together with
+the velocity perturbation $\delta\mathbf u=\pm\,\delta\B/\sqrt{4\pi\rho}$, is
+an exact nonlinear solution of ideal incompressible MHD: a
+\emph{spherically polarised} (arc-polarised, large-amplitude) Alfv\'en state.
+The solar wind is observed to be full of such states, including the
+large-amplitude ``switchbacks'' in which the field direction reverses locally
+relative to the mean. Whether genuinely three-dimensional states of this kind
+can be continued to switchback amplitude while remaining smooth --- or whether
+they are forced to develop discontinuities --- is the scientific question this
+solver exists to answer. Everything below is purely kinematic: we are
+constructing divergence-free maps $\B:\T^3\to\Sph^2$, and the MHD content
+enters only through that identification.
+
+\subsection{Formulation}
+
+Work on the flat torus $\T^3=[0,2\pi)^3$, so wavenumbers are integer vectors
+$\kk\in\Z^3$. We seek $\B:\T^3\to\R^3$ with
+\begin{equation}\label{eq:constraints}
+\nabla\cdot\B=0,\qquad |\B(\x)|=1 \quad\text{for all }\x .
+\end{equation}
+Write the constraint map
+\begin{equation}\label{eq:F}
+F(\B)=\bigl(\nabla\cdot\B,\; q\bigr),\qquad
+q:=\tfrac12\bigl(|\B|^2-1\bigr),
+\end{equation}
+so that \eqref{eq:constraints} is $F(\B)=0$. The system is
+\emph{underdetermined}: two scalar equations for three unknown components at
+every point. Solutions therefore come in large families, and a solver must
+choose which member it moves toward; that choice --- here, a weighted
+minimum-norm choice --- is a modelling decision, not an implementation
+detail, and it is the mechanism by which paths of different smoothness reach
+equal amplitude.
+
+The states of interest are continued from a uniform mean field
+$\bar\B$ (with $|\bar\B|<1$ along the way; see
+Corollary~\ref{cor:mean}) plus an arbitrary divergence-free seed
+$\bb=\nabla\times\mathbf a$, injected in small increments. This is the
+\emph{carrier-free} formulation: no one-dimensional arc-polarised carrier wave
+is used as a backbone, in contrast with the v1 stack. Decomposing
+$\B=\bar\B+\bb$ with $\langle\bb\rangle=0$, the mean of the quadratic
+constraint gives the exact identity
+\begin{equation}\label{eq:energy}
+\langle|\bb|^2\rangle = 1-|\bar\B|^2 ,
+\end{equation}
+$\langle\cdot\rangle$ denoting the box average: the fluctuation energy is
+determined by the mean field alone.
+
+\subsection{Notation}\label{sec:notation}
+
+Throughout, all fields are real; $\hat f(\kk)$ denotes Fourier coefficients
+with the convention $\langle f,g\rangle=(2\pi)^{-3}\!\int f\cdot g
+=\sum_\kk \hat f(\kk)^*\!\cdot\hat g(\kk)$, and $k^2=|\kk|^2$. The operators
+used below are all Fourier multipliers and are collected here:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{0.80\textwidth}@{}}
+\toprule
+$\Tr$ & strict $2/3$ band projector on scalars, $\widehat{\Tr f}(\kk)=
+\mathbf 1[\,|k_i|<N_i/3\ \forall i\,]\,\hat f(\kk)$\\
+$\Trr$ & the same projector applied componentwise to a stacked $3$-vector
+field\\
+$\Pl$ & Leray (divergence-free) projector,
+$\widehat{\Pl\vv}(\kk)=(\mathsf I-\hat\kk\hat\kk^{\!\top})\hat\vv(\kk)$ with
+$\hat\kk=\kk/|\kk|$; $\Pl=\mathsf I$ at $\kk=0$\\
+$\Wm^{-2}$ & Sobolev weight, $\widehat{\Wm^{-2}f}=(1+k^2)^{-s}\hat f$, with
+$s=\texttt{smooth}\ge0$; $\Wm^{2}$ its inverse\\
+$\Zf$ & freeze mask: spectral indicator, $0$ on pinned bins (and their
+Hermitian partners), $1$ elsewhere\\
+$\Aop$ & the scalar normal operator of \eqref{eq:normal-mu}\\
+$\Minv$ & the CG preconditioner, $\Minv=\Tr(1+k^2)^{s}$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+$\Tr,\Trr,\Pl,\Wm^{\pm2},\Zf$ are all diagonal in $\kk$ (scalar multipliers
+except $\Pl$, which is a matrix multiplier), hence mutually commuting,
+self-adjoint, and $\Tr^2=\Tr$, $\Pl^2=\Pl$, $\Zf^2=\Zf$. We use these facts
+repeatedly without comment. $N_i$ is the grid size on axis $i$; grids are
+written $N_x^2\times N_z$ when $N_x=N_y$.
+
+\section{The minimum-norm Gauss--Newton step}\label{sec:mngn}
+
+Linearising \eqref{eq:F} about $\B$ gives the Jacobian
+\begin{equation}\label{eq:J}
+J\dd=\bigl(\nabla\cdot\dd,\;\B\cdot\dd\bigr),
+\end{equation}
+whose $L^2$ adjoint follows from
+$\langle J\dd,(\lambda,\mu)\rangle
+=\langle \lambda,\nabla\cdot\dd\rangle+\langle\mu,\B\cdot\dd\rangle
+=\langle \dd, -\nabla\lambda+\mu\B\rangle$ (integrating by parts on the
+torus, no boundary term):
+\begin{equation}\label{eq:JT}
+J^{\!\top}(\lambda,\mu)=-\nabla\lambda+\mu\B .
+\end{equation}
+Because $J$ has more columns than rows the Newton correction is not unique. We
+select it by a weighted minimum-norm condition: with $s\ge0$ fixed, take
+\begin{equation}\label{eq:minnorm}
+\dd=\arg\min\ \tfrac12\|\Wm\dd\|^2
+\quad\text{subject to}\quad J\dd=-F(\B),
+\qquad
+\|\Wm\dd\|^2=\sum_\kk(1+k^2)^{s}\,|\hat\dd(\kk)|^2 .
+\end{equation}
+The Lagrangian $\tfrac12\|\Wm\dd\|^2-\langle(\lambda,\mu),J\dd+F\rangle$
+stationarises at $\Wm^2\dd=J^{\!\top}(\lambda,\mu)$, so
+\begin{equation}\label{eq:step-lm}
+\dd=\Wm^{-2}J^{\!\top}(\lambda,\mu),\qquad
+\bigl(J\,\Wm^{-2}J^{\!\top}\bigr)(\lambda,\mu)=-F(\B).
+\end{equation}
+For $s=0$ this is the classical $L^2$ minimum-norm (Gauss--Newton for
+underdetermined systems) step; for $s>0$ it is the \emph{smoothest} correction
+that cancels the linearised residual, and increasing $s$ biases the
+continuation path toward smoother members of the solution family. The v1
+solver solves \eqref{eq:step-lm} for the pair $(\lambda,\mu)$ by matrix-free
+conjugate gradients. Section~\ref{sec:reduction} eliminates $\lambda$.
+
+The outer iteration is
+\begin{equation}\label{eq:sweep}
+\B\ \longleftarrow\ \B+\dd ,
+\end{equation}
+which we call a \emph{sweep}. Since $F$ is quadratic, the exact second-order
+remainder is available in closed form and will be used in
+Section~\ref{sec:galerkin}:
+\begin{equation}\label{eq:remainder}
+q(\B+\dd)=q(\B)+\B\cdot\dd+\tfrac12|\dd|^2,\qquad
+\nabla\cdot(\B+\dd)=\nabla\cdot\B+\nabla\cdot\dd .
+\end{equation}
+
+\section{Elimination of \texorpdfstring{$\lambda$}{lambda}: the
+vector-potential form}\label{sec:reduction}
+
+This section is the centrepiece. The divergence row of \eqref{eq:step-lm} can
+be solved for $\lambda$ in closed form, independently of the weight, leaving a
+single scalar equation for $\mu$; the resulting step is precisely the
+minimum-norm correction written in vector-potential variables.
+
+\subsection{The Schur reduction}
+
+\begin{proposition}[$\lambda$-elimination]\label{prop:schur}
+Let $\B$ be divergence-free, so that the first component of $F(\B)$ vanishes,
+and let $\Wm^{-2}$ be any Fourier multiplier of the form $w(k^2)$. Then the
+solution of \eqref{eq:step-lm} satisfies
+\begin{equation}\label{eq:lambda}
+\hat\lambda(\kk)=-\,\frac{i\,\kk\cdot\widehat{(\mu\B)}(\kk)}{k^2}
+\qquad(\kk\neq0),
+\end{equation}
+independently of $w$, and the correction reduces to
+\begin{equation}\label{eq:step-mu}
+\boxed{\ \dd=\Wm^{-2}\Pl(\mu\B)\ }
+\end{equation}
+with $\Pl$ the Leray projector. The remaining (Schur-complement) normal
+equation is the scalar problem
+\begin{equation}\label{eq:normal-mu}
+\Aop\mu:=\B\cdot\Wm^{-2}\Pl(\mu\B)=-q .
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The divergence row of \eqref{eq:step-lm} reads
+$\nabla\cdot\bigl[\Wm^{-2}(-\nabla\lambda+\mu\B)\bigr]=-\nabla\cdot\B=0$. In
+Fourier variables, with $\widehat{\nabla\lambda}=i\kk\hat\lambda$ and
+$\widehat{\nabla\cdot\vv}=i\kk\cdot\hat\vv$, this is
+\[
+w(k^2)\Bigl[k^2\hat\lambda(\kk)
++i\,\kk\cdot\widehat{(\mu\B)}(\kk)\Bigr]=0 ,
+\]
+which for $\kk\ne0$ gives \eqref{eq:lambda} whenever $w(k^2)\neq0$; the
+common factor $w$ cancels, which is why the elimination is weight-independent.
+Substituting into $\dd=\Wm^{-2}(-\nabla\lambda+\mu\B)$,
+\[
+\hat\dd(\kk)=w(k^2)\Bigl[\widehat{(\mu\B)}(\kk)
+-\frac{\kk\,\bigl(\kk\cdot\widehat{(\mu\B)}(\kk)\bigr)}{k^2}\Bigr]
+=w(k^2)\,\bigl(\mathsf I-\hat\kk\hat\kk^{\!\top}\bigr)\widehat{(\mu\B)}(\kk).
+\]
+At $\kk=0$ the divergence row is vacuous, $\lambda$ is undetermined (a
+constant, which contributes nothing), and $\hat\dd(0)=\widehat{(\mu\B)}(0)$,
+consistent with the convention $\Pl=\mathsf I$ at $\kk=0$. This is
+\eqref{eq:step-mu}. The second row of \eqref{eq:step-lm},
+$\B\cdot\dd=-q$, is then \eqref{eq:normal-mu}.
+\end{proof}
+
+\begin{proposition}[symmetry and positivity]\label{prop:spd}
+$\Aop$ is self-adjoint and positive semi-definite; indeed
+$\Aop=G^{\!\top}G$ with $G\mu:=\Wm^{-1}\Pl(\mu\B)$, and
+$\langle\mu,\Aop\mu\rangle=\|\Wm^{-1}\Pl(\mu\B)\|^2$. Its null space is
+$\{\mu:\Pl(\mu\B)=0\}$; in particular $\Aop\,1=|\B|^2=1$ at a solution, so
+constants are not null.
+\end{proposition}
+
+\begin{proof}
+$\langle\mu',\Aop\mu\rangle=\langle\mu'\B,\Wm^{-2}\Pl(\mu\B)\rangle$. Since
+$\Wm^{-2}$ and $\Pl$ commute, are self-adjoint, and $\Pl^2=\Pl$, we may write
+$\Wm^{-2}\Pl=(\Wm^{-1}\Pl)^{\!\top}(\Wm^{-1}\Pl)$, giving
+$\langle\mu',\Aop\mu\rangle=\langle G\mu',G\mu\rangle$. For the last
+statement, $\Pl\B=\B$ because $\B$ is divergence-free.
+\end{proof}
+
+Proposition~\ref{prop:spd} is what licenses conjugate gradients on
+\eqref{eq:normal-mu}, and it survives every modification made below (band
+projection, freeze masks), because each is a commuting self-adjoint
+projection.
+
+\subsection{The vector-potential reading}
+
+The correction \eqref{eq:step-mu} is divergence-free by construction, hence a
+curl. The following identifies the potential and shows that the reduction is
+not merely algebraic bookkeeping: it is the minimum-norm step taken in the
+variables $\A$, with $\B=\bar\B+\nabla\times\A$.
+
+\begin{proposition}[potential form]\label{prop:potential}
+For any field $\vv$ with $\langle\vv\rangle=0$, let
+$\A_\vv:=\nabla\times(-\nabla^2)^{-1}\vv$, i.e.\
+$\hat\A_\vv(\kk)=i\kk\times\hat\vv(\kk)/k^2$. Then $\A_\vv$ is in the Coulomb
+gauge, $\nabla\cdot\A_\vv=0$, and
+\begin{equation}\label{eq:curlcurl}
+\nabla\times\A_\vv=\Pl\vv .
+\end{equation}
+Consequently $\dd=\nabla\times\dd\A$ with
+$\dd\A=\Wm^{-2}\nabla\times(-\nabla^2)^{-1}(\mu\B)$: the step
+\eqref{eq:step-mu} is the curl of the (weighted) minimum-norm Coulomb-gauge
+potential generated by $\mu\B$.
+\end{proposition}
+
+\begin{proof}
+Coulomb gauge is immediate from
+$\kk\cdot(\kk\times\hat\vv)=0$. For \eqref{eq:curlcurl} use
+$\nabla\times\nabla\times\vv=-\nabla^2\vv+\nabla(\nabla\cdot\vv)$, applied to
+$(-\nabla^2)^{-1}\vv$:
+\[
+\nabla\times\A_\vv
+=\nabla\times\nabla\times(-\nabla^2)^{-1}\vv
+=\vv-\nabla(\nabla\cdot(-\nabla^2)^{-1}\vv),
+\]
+whose Fourier transform is
+$\hat\vv-\kk(\kk\cdot\hat\vv)/k^2=\Pl\hat\vv$.
+\end{proof}
+
+\begin{remark}[which norm is minimised]\label{rem:norms}
+For a mean-free divergence-free field $\dd$ with Coulomb-gauge potential
+$\dd\A$ we have $\hat\dd=i\kk\times\hat{\dd\A}$ with
+$\hat{\dd\A}\perp\kk$, hence the exact modewise relation
+\begin{equation}\label{eq:normshift}
+|\hat{\dd\A}(\kk)|=|\hat\dd(\kk)|/|\kk| .
+\end{equation}
+Minimising $\|\dd\A\|_{L^2}$ is therefore minimising
+$\sum_\kk|\hat\dd|^2/k^2$, a homogeneous $H^{-1}$ norm on $\dd$: working in
+potential variables shifts the smoothing index by one. The weighted families
+correspond as $s_\A\leftrightarrow s_\B+1$, exactly for the homogeneous weight
+$k^{2s}$ and up to the low-$\kk$ difference between $(1+k^2)$ and $k^2$ for
+the inhomogeneous weight used in the code. We keep the $\B$-side convention
+$(1+k^2)^{-s}$ throughout, so that $s=0$ means the plain $L^2$ minimum-norm
+step and no operator has a singularity at $\kk=0$.
+\end{remark}
+
+The practical significance is that the unknown of a sweep is a single scalar
+field $\mu$, that the divergence constraint is discharged analytically rather
+than iteratively, and that the CG operator applies $\Pl$ --- one batched
+transform pair --- instead of a gradient and a divergence.
+
+\subsection{Two corollaries}
+
+\begin{corollary}[divergence is preserved, not repaired]\label{cor:div}
+Every step \eqref{eq:step-mu} satisfies $\nabla\cdot\dd=0$ exactly (to
+round-off), so $\nabla\cdot\B$ is invariant along the whole solve. Measured:
+$\max|\nabla\cdot\B|<10^{-13}$ per sweep at $64^2\times128$. Conversely, a
+pre-existing divergence error is \emph{not} removed by any number of sweeps.
+\end{corollary}
+
+\begin{proof}
+$\kk\cdot\widehat{\Pl\vv}(\kk)=0$ by construction, and $\Wm^{-2}$ is a scalar
+multiplier. Invariance in both directions follows from
+\eqref{eq:remainder}.
+\end{proof}
+
+This is a deliberate trade. In the coupled $(\lambda,\mu)$ system the
+divergence row carries the right-hand side $-\nabla\cdot\B$ and the solver
+spends iterations removing a divergence error that the linear projector
+removes exactly and for free. The v2 convention is therefore: \emph{project
+once at entry},
+\begin{equation}\label{eq:project}
+\B\ \longleftarrow\ \Trr\,\Pl\,\B \qquad\text{(mean preserved)},
+\end{equation}
+and never again. The API separates the two (\texttt{project} versus
+\texttt{gn}) so that the assumption of Proposition~\ref{prop:schur} is visible
+at the call site rather than buried.
+
+\begin{corollary}[the mean field]\label{cor:mean}
+The $\kk=0$ component of a step is
+$\dd\bar\B=\langle\mu\B\rangle$. Zeroing that bin (equivalently, including
+$\kk=0$ in the freeze mask $\Zf$) holds $\bar\B$ fixed for the entire
+continuation. Fixed-mean growth is only possible for $|\bar\B|<1$: if
+$|\bar\B|=1$ then $\B\equiv\bar\B$.
+\end{corollary}
+
+\begin{proof}
+The first claim is $\Pl=\mathsf I$ at $\kk=0$. For the second, Cauchy--Schwarz
+(Jensen) gives $1=|\langle\B\rangle|^2\le\langle|\B|^2\rangle=1$ with equality
+if and only if $\B$ is constant almost everywhere; this is
+\eqref{eq:energy} with $\langle|\bb|^2\rangle=0$.
+\end{proof}
+
+Corollary~\ref{cor:mean} is enforced at the driver level: \texttt{--fix-mean}
+is refused with an explicit message when $|\bar\B|\ge1-10^{-9}$, because the
+requested continuation then provably does not exist.
+
+\section{Galerkin discretisation}\label{sec:galerkin}
+
+\subsection{\texorpdfstring{The strict $2/3$ band}{The strict 2/3 band}}
+
+Fix a grid $N_x\times N_y\times N_z$ and the \emph{retained band}
+\begin{equation}\label{eq:band}
+\mathcal K_N:=\bigl\{\kk\in\Z^3:\ |k_i|<N_i/3\ \text{for }i=1,2,3\bigr\},
+\end{equation}
+with band projector $\Tr$ (componentwise $\Trr$). The strict inequality is
+load-bearing. With the inclusive cutoff $|k_i|\le N_i/3$, the product of two
+modes sitting exactly on the cutoff has a component at $2N_i/3$, which aliases
+to $2N_i/3-N_i=-N_i/3$: exactly onto the retained band edge. Orszag's
+exactness argument then fails for the quadratic nonlinearity, and the
+Galerkin claims of this section become false. (In the code this is the
+$-10^{-12}$ guard in the axis mask; the comparison must not be left to
+floating-point luck when $N_i$ is a multiple of $3$.)
+
+The unknown is a band-limited field, $\B=\Trr\B$, and the discretised
+constraint map is
+\begin{equation}\label{eq:FG}
+F_G(\B)=\bigl(\nabla\cdot\B,\;\Tr q\bigr),\qquad q=\tfrac12(|\B|^2-1),
+\end{equation}
+the divergence of a band-limited field being band-limited already. The
+reported residual is $\max|\Tr q|$.
+
+\begin{proposition}[Orszag exactness]\label{prop:orszag}
+Let $u,v$ be band-limited, $\supp\hat u,\supp\hat v\subset\mathcal K_N$, and
+let $\widehat{uv}^{\,\mathrm{disc}}$ denote the DFT of their pointwise product
+sampled on the $N$-grid. Then
+$\widehat{uv}^{\,\mathrm{disc}}(\kk)=\widehat{uv}(\kk)$ for all
+$\kk\in\mathcal K_N$: the retained-band equations of \eqref{eq:FG} are exact
+continuum equations, carrying no discretisation error whatsoever.
+\end{proposition}
+
+\begin{proof}
+Sampling folds frequencies modulo $N_i$ on each axis:
+$\widehat{uv}^{\,\mathrm{disc}}(\kk)=\sum_{\mathbf j\in\Z^3}
+\widehat{uv}(\kk+N\mathbf j)$, where $N\mathbf j$ means
+$(N_1j_1,N_2j_2,N_3j_3)$. The true product has
+$\supp\widehat{uv}\subset\mathcal K_N+\mathcal K_N\subset
+\{|k_i|<2N_i/3\}$. For $\kk\in\mathcal K_N$ and $j_i\neq0$,
+$|k_i+N_ij_i|\ge N_i-N_i/3=2N_i/3$, so every alias term vanishes.
+\end{proof}
+
+\subsection{Tail honesty}
+
+The out-of-band content of $q$ on the \emph{same} grid is the diagnostic
+\texttt{tail\_norm}: the rms and max of $q-\Tr q$. Its meaning is the
+following.
+
+\begin{proposition}[alias fold, one-sided]\label{prop:tail}
+With $\B$ band-limited, write $c_\mathbf m:=\hat q(\mathbf m)$ for the true
+(continuum) coefficients of $q$, supported in $\{|m_i|<2N_i/3\}$, and
+$d_\kk$ for the discrete coefficients at grid bins $\kk\notin\mathcal K_N$.
+Then $d_\kk=\sum_{\mathbf m\equiv\kk\,(\mathrm{mod}\,N)}c_\mathbf m$, each
+class containing at most $2$ frequencies per axis and hence at most $8$ in
+total, and
+\begin{equation}\label{eq:tailbound}
+\Bigl(\sum_{\mathbf m\notin\mathcal K_N}|c_\mathbf m|^2\Bigr)^{1/2}
+\ \ge\ \frac{1}{\sqrt8}\,
+\Bigl(\sum_{\kk\notin\mathcal K_N}|d_\kk|^2\Bigr)^{1/2}.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The fold formula is Proposition~\ref{prop:orszag}'s identity at
+$\kk\notin\mathcal K_N$; the in-band bins receive no aliases, so all true
+tail power lands out of band. On axis $i$, the frequencies of a residue class
+lie in an interval of length $4N_i/3$ and are spaced $N_i$ apart, so at most
+two are occupied. Cauchy--Schwarz gives $|d_\kk|^2\le8\sum|c_\mathbf m|^2$
+over the class, and summing over the (disjoint) classes gives
+\eqref{eq:tailbound}.
+\end{proof}
+
+Thus \texttt{tail\_norm} measures the genuine unresolved burden of the
+continuum problem on a single grid, up to a factor $\sqrt8$ in the safe
+direction: it never overstates the true tail by more than that. It can in
+principle understate it, if two occupied fold partners cancel; we have not
+observed this, and an exact check is cheap when wanted, because
+$\supp\hat q\subset\{|k_i|<2N_i/3\}$ lies strictly inside the Nyquist band of
+the $2\times$ zero-padded grid, so the padded $q$-spectrum is alias-free
+(\texttt{spectra.q\_spectrum}). The point of the Galerkin mode is that the
+honest diagnostic is available at working resolution: a collocation residual,
+by contrast, is blind to aliasing by construction.
+
+\subsection{The exact Galerkin Jacobian and quadratic convergence}
+
+Differentiating \eqref{eq:FG} in a band-limited direction $\dd$,
+\begin{equation}\label{eq:JG}
+J_G\dd=\bigl(\nabla\cdot\dd,\ \Tr(\B\cdot\dd)\bigr),
+\qquad
+J_G^{\!\top}(\lambda,\mu)=\Trr\bigl(-\nabla\lambda+\mu\B\bigr),
+\end{equation}
+the adjoint being computed in the space of band-limited fields:
+$\langle\Tr(\B\cdot\dd),\mu\rangle=\langle\dd,\Trr(\mu\B)\rangle$ for
+$\mu=\Tr\mu$. Repeating Proposition~\ref{prop:schur} verbatim (all operators
+involved commute) gives the discrete step and normal equation actually
+implemented:
+\begin{equation}\label{eq:step-G}
+\dd=\Wm^{-2}\Zf\,\Pl\,\Trr(\mu\B),
+\qquad
+\Aop\mu=\Tr\bigl[\B\cdot\Wm^{-2}\Zf\,\Pl\,\Trr(\mu\B)\bigr]=-\Tr q ,
+\end{equation}
+with $\Zf\equiv1$ when nothing is frozen. Proposition~\ref{prop:spd} applies
+unchanged, since $\Tr$ and $\Zf$ are commuting self-adjoint projections:
+$\Aop=G^{\!\top}G$ with $G\mu=\Wm^{-1}\Zf\Pl\Trr(\mu\B)$.
+
+\begin{theorem}[exact quadratic sweep]\label{thm:quad}
+Let $\B=\Trr\B$ be divergence-free and band-limited, let $\dd$ solve
+\eqref{eq:step-G} exactly with $\Zf\equiv1$, and set $\B'=\B+\dd$. Then
+$\B'$ is band-limited and divergence-free, and
+\begin{equation}\label{eq:quad}
+\Tr q(\B')=\tfrac12\,\Tr\bigl(|\dd|^2\bigr),
+\qquad\text{hence}\qquad
+\bigl\|\Tr q(\B')\bigr\|_\infty\le\tfrac12\|\dd\|_\infty^2 .
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+$\dd$ is band-limited because $\Trr$ appears inside \eqref{eq:step-G}, so
+$\Trr\B'=\B'$ and the sweep's truncation is a no-op; it is divergence-free by
+Corollary~\ref{cor:div}. Apply $\Tr$ to the exact expansion
+\eqref{eq:remainder}: $\Tr q(\B')=\Tr q+\Tr(\B\cdot\dd)+\tfrac12\Tr|\dd|^2$,
+and $\Tr(\B\cdot\dd)=-\Tr q$ is exactly the normal equation. Note that
+$\Tr(|\dd|^2)$ is itself exact by Proposition~\ref{prop:orszag}.
+\end{proof}
+
+Theorem~\ref{thm:quad} is not an asymptotic statement: the new residual
+\emph{equals} half the band projection of $|\dd|^2$, with no neglected terms.
+Since $\Aop$ has an $O(1)$ symbol (Section~\ref{sec:symbol}), $\|\dd\|$ is
+comparable to $\|\Tr q\|$ and the observed contraction constant should be
+close to $\tfrac12$. It is: the measured sequences in
+Table~\ref{tab:measured}(a) give ratios
+$1.3\times10^{-5}/(5.0\times10^{-3})^2=0.52$ and
+$8.3\times10^{-11}/(1.3\times10^{-5})^2=0.49$ at $s=0$, and $0.54$, $0.51$ at
+$s=1$, before the fourth sweep hits the round-off floor. Four sweeps take the
+residual from $5\times10^{-3}$ to machine precision.
+
+\subsection{Relation to the legacy coupled solver}\label{sec:legacy}
+
+The v1 solver is the coupled system \eqref{eq:step-lm} in $(\lambda,\mu)$,
+discretised with \emph{collocation} operators as the CG step model while
+driving the Galerkin residual $\Tr q$ to zero --- deliberately an inexact
+Newton method. That choice was empirically forced: with band-truncated
+$(\lambda,\mu)$ operators and a CG iteration budget, the solve exhibited a
+limit cycle with a large residual amplification, attributed at the time to
+near-null band-edge directions of the projected normal operator. As inexact
+Newton it converges only linearly, roughly a factor $1.5$--$2$ per sweep below
+the tail scale.
+
+The measurements reported here revise the attribution, and we state the
+revision as an empirical finding with its evidence attached. The $\mu$-only
+formulation uses the \emph{exact Galerkin} operator \eqref{eq:step-G}, band
+projections and all, and no limit cycle occurs at any $s$ or grid we have run;
+convergence is quadratic with the constant predicted by
+Theorem~\ref{thm:quad}. The distinction is therefore not ``projected versus
+unprojected operators'' --- v2 projects --- but the elimination of $\lambda$
+together with the removal of a truncated CG budget on a coupled, badly
+conditioned system. We attribute the limit cycle to the latter, not to
+operator projection per se. We have not built a minimal reproducer isolating
+the two effects, so this is an inference from two implementations' behaviour
+rather than a proof. The legacy rule of thumb (expect linear convergence, set
+\texttt{--res-ok} near $10^{-2}\times$\texttt{gal\_tail\_rms}) is retained for
+the legacy solver and does \emph{not} apply to v2, where the residual should
+reach the round-off floor in a handful of sweeps.
+
+\section{The normal operator: symbol, conditioning, cost}\label{sec:symbol}
+
+\subsection{Symbol}
+
+\begin{proposition}[frozen-coefficient symbol]\label{prop:sym}
+Freeze $\B$ at a constant unit vector $\B_0$ (the leading term of the symbol
+for slowly varying $\B$). Then $\Aop$ acts on $\hat\mu(\kk)$ by
+multiplication by
+\begin{equation}\label{eq:symbol}
+a(\kk)=(1+k^2)^{-s}\Bigl(|\B_0|^2-(\B_0\cdot\hat\kk)^2\Bigr)
+=(1+k^2)^{-s}\sin^2\theta(\hat\kk,\B_0)\ \in[0,1],
+\end{equation}
+using $|\B_0|=1$; $\theta$ is the angle between $\kk$ and the local field.
+\end{proposition}
+
+\begin{proof}
+$\mu\B_0$ has transform $\hat\mu\B_0$; applying
+$\Pl$ gives $\hat\mu(\mathsf I-\hat\kk\hat\kk^{\!\top})\B_0$, applying
+$\Wm^{-2}$ multiplies by $(1+k^2)^{-s}$, and contracting with $\B_0$ gives
+$(1+k^2)^{-s}\hat\mu(|\B_0|^2-(\B_0\cdot\hat\kk)^2)$.
+\end{proof}
+
+The symbol factorises into an extrinsic and an intrinsic part.
+
+\paragraph{The $(1+k^2)^{-s}$ factor is removable.} It spans
+$1$ to $(1+k_{\max}^2)^{-s}$ across the band. At $64^2\times128$ the band edge
+is $|k_i|<21$, so $k^2$ reaches $\sim1.3\times10^3$ and the weighted operator
+($s=1$) has a spectral spread of order $10^3$ from this factor alone, on top
+of the geometric factor. It is exactly cancelled by the diagonal
+preconditioner
+\begin{equation}\label{eq:pc}
+\Minv=\Tr\,(1+k^2)^{s},
+\end{equation}
+which costs one scalar transform pair per CG iteration. Table~\ref{tab:measured}(b)
+shows the effect: unpreconditioned weighted CG stalls (more than $1500$
+iterations, budget-limited at relative residual $\sim10^{-7}$), while
+preconditioned CG reaches relative residual $10^{-13}$ in a few hundred.
+
+\paragraph{The $\sin^2\theta$ factor is intrinsic.} It degenerates for
+$\kk\parallel\B$: a modulation of $\mu$ along the field produces no admissible
+correction at all. The mechanism is transparent in the frozen-coefficient
+picture --- if $\B_0=\hat z$ and $\mu=\mu(z)$ then
+$\mu\B_0=\nabla\!\int^z\!\mu$ is a pure gradient, annihilated by $\Pl$ --- and
+it is the linearised shadow of the rigidity of band-limited constant-$|\B|$
+fields (extreme modes forced null and transverse, so that genuinely 3D states
+cannot terminate their spectrum): the directions along which the constraint
+manifold offers no motion are exactly the field-aligned ones, and they are
+never absent. The factor is bounded in $[0,1]$, so it costs conditioning but
+not solvability, and it is not preconditionable by any Fourier multiplier.
+
+\subsection{Cost per CG iteration}
+
+Applying $\Aop$ in the form \eqref{eq:step-G} costs: one batched
+three-component real transform pair inside $\Pl\Wm^{-2}\Zf\Trr$ (six real
+scalar transforms, executed as two batched calls), plus one scalar transform
+pair for the band projection of the output ($2$); the preconditioner
+\eqref{eq:pc} adds one scalar pair ($2$). The pointwise multiplications
+$\mu\B$ and $\B\cdot(\cdot)$ require no transform. The coupled $(\lambda,\mu)$
+operator, by comparison, costs $8$ real transforms unweighted and $11$
+weighted, plus $2$ for its preconditioner, and carries four fields through the
+CG recurrence rather than one. Combined with the iteration counts, this is the
+factor $5$--$8$ in wall-clock per sweep recorded in
+Table~\ref{tab:measured}(c).
+
+\section{Measurements}\label{sec:measured}
+
+All numbers in Table~\ref{tab:measured} were measured on 2026-08-23 on a CPU
+development machine, at $64^2\times128$, starting from an $\epsilon\approx1$
+switchback state; the production target is a Kaggle P100, where absolute
+timings differ but the ratios do not. CG counts are to relative residual
+$10^{-13}$ (the code's stop is $\|r\|^2<10^{-26}\|r_0\|^2$).
+
+\begin{table}[htbp]
+\centering
+\caption{Measured behaviour of the v2 ($\mu$-only) solver against the legacy
+coupled $(\lambda,\mu)$ solver. CPU development machine, $64^2\times128$,
+$\epsilon\approx1$ switchback state, 2026-08-23.}
+\label{tab:measured}
+\medskip
+\small
+\begin{tabular}{lcccc}
+\multicolumn{5}{c}{\textbf{(a) Galerkin Newton residual $\max|\Tr q|$ per sweep}}\\
+\toprule
+& sweep 1 & sweep 2 & sweep 3 & sweep 4\\
+\midrule
+$s=0$ & $5.0\times10^{-3}$ & $1.3\times10^{-5}$ & $8.3\times10^{-11}$ & $8.2\times10^{-16}$\\
+$s=1$ & $5.1\times10^{-3}$ & $1.4\times10^{-5}$ & $9.9\times10^{-11}$ & $1.0\times10^{-15}$\\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{tabular}{lcc}
+\multicolumn{3}{c}{\textbf{(b) CG iterations to relative residual $10^{-13}$}}\\
+\toprule
+system & $s=0$ & $s=1$\\
+\midrule
+$\mu$-only, preconditioned \eqref{eq:pc} & $244$--$284$ & $291$--$366$\\
+$\mu$-only, unpreconditioned & --- & $>1500$ (stall, rel.\ res.\ $\sim10^{-7}$)\\
+coupled $(\lambda,\mu)$, Laplacian-block pcg & $916$--$1499$ & not converged in budget\\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{tabular}{lccc}
+\multicolumn{4}{c}{\textbf{(c) Wall-clock per sweep (CPU) and transform budget}}\\
+\toprule
+system & $s=0$ & $s=1$ & real transforms per CG iteration\\
+\midrule
+coupled $(\lambda,\mu)$ + pcg & $23$\,s & $47$\,s & $8$ ($s=0$) / $11$ ($s>0$), $+2$ pcg\\
+$\mu$-only + $\Wm^{-2}$ & $4.9$\,s & $5.7$\,s & $6+2$, $+2$ pcg\\
+\bottomrule
+\end{tabular}
+
+\medskip
+\begin{tabular}{ll}
+\multicolumn{2}{c}{\textbf{(d) Invariants}}\\
+\toprule
+$\max|\nabla\cdot\B|$ per sweep & $<10^{-13}$ (Corollary~\ref{cor:div})\\
+observed quadratic constant in \eqref{eq:quad} & $0.49$--$0.54$ (predicted $\tfrac12$)\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Pinning genuine three-dimensionality}\label{sec:pin}
+
+The solution family contains one-dimensional members (arc- and circularly
+polarised waves) which are smooth at every amplitude and are strong attractors
+for any smoothing-biased path. Since the scientific question concerns
+\emph{genuinely three-dimensional} states, the continuation needs a constraint
+that provably excludes the degenerate classes.
+
+\begin{definition}\label{def:dim}
+Let $S=\supp\hat\B\setminus\{0\}$. The state $\B$ is \emph{one-dimensional
+(1D)} if $S$ is contained in a line through the origin, and \emph{planar
+(2.5D)} if $S$ is contained in a plane through the origin. Otherwise it is
+\emph{genuinely three-dimensional}.
+\end{definition}
+
+\begin{lemma}[three non-coplanar pins suffice]\label{lem:pin}
+Let $\kk_1,\kk_2,\kk_3\in\Z^3\setminus\{0\}$ with
+$\det[\kk_1\,\kk_2\,\kk_3]\neq0$, and suppose the state satisfies
+$|\hat\B(\kk_j)|^2=e_j>0$ for $j=1,2,3$. Then $\B$ is neither 1D nor planar.
+\end{lemma}
+
+\begin{proof}
+The hypothesis puts $\kk_1,\kk_2,\kk_3\in S$. If $S$ lay in a line through the
+origin the three would be pairwise parallel, and if $S$ lay in a plane through
+the origin the three would be coplanar; either way
+$\det[\kk_1\,\kk_2\,\kk_3]=0$, a contradiction.
+\end{proof}
+
+A quantitative version uses the $\kk$-space inertia tensor of the
+fluctuation, which is also the runtime monitor
+(\texttt{spectra.kspace\_inertia}):
+\begin{equation}\label{eq:inertia}
+\mathsf T:=\sum_{\kk\neq0}|\hat\B(\kk)|^2\,\hat\kk\hat\kk^{\!\top},
+\qquad \lambda_1\ge\lambda_2\ge\lambda_3\ge0,
+\qquad \tr\mathsf T=1-|\bar\B|^2,
+\end{equation}
+the trace identity being \eqref{eq:energy}. Then $\rank\mathsf T=1$ iff 1D,
+$\rank\mathsf T\le2$ iff planar, and under Lemma~\ref{lem:pin}'s hypothesis
+$\mathsf T\succeq\sum_je_j\hat\kk_j\hat\kk_j^{\!\top}\succ0$, because
+$\sum_je_j(\hat\kk_j\cdot\vv)^2=0$ forces $\vv$ orthogonal to three
+non-coplanar vectors. The driver logs $\lambda_2/\lambda_1$ and
+$\lambda_3/\lambda_1$; $(0,0)$ is 1D, $(x,0)$ planar, both positive genuinely
+3D.
+
+\begin{remark}[why one scalar pin fails]\label{rem:scalarpin}
+A natural cheap alternative is a single scalar overlap constraint
+$\langle\B,\bb\rangle=c$ with $\bb$ the 3D seed. It does not pin anything.
+Pick any $\kk_0\in\supp\hat\bb$ and consider the family of 1D circularly
+polarised states whose support lies on the line $\R\kk_0$; the value of the
+single linear functional $\langle\B,\bb\rangle$ varies continuously over that
+family (through the relative phase and amplitude of the mode at $\kk_0$) and
+sweeps an interval containing $c$ for any $c$ below the Cauchy--Schwarz
+ceiling $\|\B\|\,\|\bb\|$. A one-dimensional constraint cannot exclude an
+infinite-dimensional degenerate class: the whole prescribed overlap can be
+carried by a single mode of a 1D state. Lemma~\ref{lem:pin} avoids this by
+constraining three \emph{separate} bin energies, which is a statement about
+the support, not about a projection.
+\end{remark}
+
+\subsection{Implementation (v1): frozen modes}
+
+The cheap implementation masks the correction off the pinned bins. Let $\Zf$
+be the spectral indicator that vanishes on the chosen bins and $1$ elsewhere;
+the step is \eqref{eq:step-G}. Two points deserve emphasis.
+
+\emph{First, this is still an exact constrained minimum-norm step.} Solving
+\eqref{eq:minnorm} with the additional linear constraints
+$\hat\dd(\kk_j)=0$, the stationarity condition becomes
+$\Wm^2\dd=J^{\!\top}(\lambda,\mu)+(\mathsf I-\Zf)\xi$ for a multiplier
+field $\xi$; imposing $\dd=\Zf\dd$ and using $\Zf(\mathsf I-\Zf)=0$ together
+with the commutation of $\Zf$ with $\Wm^{-2}$ and $\Pl$ gives
+$\dd=\Zf\Wm^{-2}J^{\!\top}(\lambda,\mu)$, which is \eqref{eq:step-G}. The
+$\lambda$-elimination goes through modewise: on retained bins it is
+Proposition~\ref{prop:schur}, and on frozen bins the divergence row is
+vacuous and $\hat\dd$ vanishes anyway. Symmetry and positivity
+(Proposition~\ref{prop:spd}) are unaffected.
+
+\emph{Second, the Hermitian-partner rule.} In the \texttt{rfftn} layout the
+$k_z=0$ plane stores both $(k_x,k_y,0)$ and its conjugate partner
+$(-k_x,-k_y,0)$ in the same half-array (the $k_z=N_z/2$ plane lies outside the
+retained band, so this is the only in-band case). Any per-bin mask must zero
+\emph{both} partners; otherwise the inverse real transform silently
+symmetrises and the mask leaks a factor-of-two error into the frozen
+amplitude.
+
+Under freezing, the pinned amplitudes evolve only through the explicit seed
+injection of the continuation driver (Section~\ref{sec:driver}), never through
+the solve. The mean-field freeze of Corollary~\ref{cor:mean} is the same
+mechanism with $\kk=0$.
+
+\subsection{Implementation (v2): bordered energy rows}
+
+Freezing fixes the pinned \emph{coefficients}; the scientifically meaningful
+constraint is on the pinned \emph{energies}, which leaves the phases free.
+Define, for a conjugate pair $\{\pm\kk_j\}$ with spectral projector
+$\Pl_{\kk_j}$ (a self-adjoint projection on real fields),
+\begin{equation}\label{eq:erows}
+e_j(\B):=\langle\B,\Pl_{\kk_j}\B\rangle=2|\hat\B(\kk_j)|^2,
+\qquad
+\gv_j:=\nabla e_j=2\,\Pl_{\kk_j}\B ,
+\end{equation}
+so that $\delta e_j=\langle\gv_j,\dd\rangle$. Appending these $m$ rows to the
+Jacobian,
+\begin{equation}\label{eq:Jtilde}
+\tilde J\dd=\bigl(\nabla\cdot\dd,\ \Tr(\B\cdot\dd),\
+\langle\gv_j,\dd\rangle_{j=1}^m\bigr),
+\end{equation}
+the minimum-norm step becomes, after the same $\lambda$-elimination,
+\begin{equation}\label{eq:bordered-step}
+\dd=\Wm^{-2}\Pl\Trr(\mu\B)+\sum_{j=1}^m\nu_j\,\Wm^{-2}\gv_j ,
+\end{equation}
+with $(\mu,\nu)\in\Tr L^2\times\R^m$ solving the bordered SPD system
+\begin{equation}\label{eq:bordered}
+\begin{pmatrix}
+\Aop & C\\ C^{\!\top} & D
+\end{pmatrix}
+\begin{pmatrix}\mu\\ \nu\end{pmatrix}
+=\begin{pmatrix}-\Tr q\\ \Delta e\end{pmatrix},
+\qquad
+(C\nu)=\sum_j\nu_j\,\Tr\bigl[\B\cdot\Wm^{-2}\gv_j\bigr],
+\quad
+D_{jl}=\langle\gv_j,\Wm^{-2}\gv_l\rangle .
+\end{equation}
+The border is cheap. Each $\gv_j$ is supported on a single conjugate mode
+pair, so $\Wm^{-2}\gv_j=(1+|\kk_j|^2)^{-s}\gv_j$ is a scalar multiple (no
+transform), $\Pl\gv_j=\gv_j$ (each mode of a divergence-free field is
+transverse), and distinct pairs are orthogonal, so
+$D=\mathrm{diag}\bigl((1+|\kk_j|^2)^{-s}\|\gv_j\|^2\bigr)$ is diagonal and
+positive. One may therefore either run CG on the whole $(\mu,\nu)$ vector, or
+eliminate $\nu=D^{-1}(\Delta e-C^{\!\top}\mu)$ and run CG on the rank-$m$
+modified operator $\Aop-CD^{-1}C^{\!\top}$, each of whose applications costs
+$m$ inner products beyond \eqref{eq:step-G}.
+
+\section{Smoothest-state descent (experimental)}\label{sec:descent}
+
+The pinned-energy machinery makes a sharper question available: given a
+genuinely 3D anchor of prescribed strength, \emph{how much spectral tail is
+forced}? Operationally, minimise a smoothness functional over the constraint
+manifold at fixed pinned energies.
+
+Take
+\begin{equation}\label{eq:R}
+R(\B)=\tfrac12\|\Wm\B\|^2=\tfrac12\sum_\kk(1+k^2)^s|\hat\B(\kk)|^2,
+\qquad \nabla R(\B)=\Wm^2\B,\quad\text{so}\quad \Wm^{-2}\nabla R(\B)=\B .
+\end{equation}
+
+\begin{proposition}[SQP step]\label{prop:sqp}
+Minimising $R(\B+\dd)$ subject to the linearised constraints $J\dd=-F(\B)$
+gives
+\begin{equation}\label{eq:sqp}
+\dd=-\B+\Wm^{-2}J^{\!\top}\nu,
+\qquad
+\bigl(J\Wm^{-2}J^{\!\top}\bigr)\nu=J\B-F(\B) :
+\end{equation}
+the same normal system as \eqref{eq:step-lm} with a modified right-hand side.
+After the $\lambda$-elimination and Galerkin projection this reads
+\begin{equation}\label{eq:sqp-mu}
+\Aop\mu=\Tr q+1,\qquad \dd=-\B+\Wm^{-2}\Pl\Trr(\mu\B).
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Stationarity of
+$\tfrac12\|\Wm(\B+\dd)\|^2-\langle\nu,J\dd+F\rangle$ gives
+$\Wm^2(\B+\dd)=J^{\!\top}\nu$, i.e.\ \eqref{eq:sqp}; substituting into
+$J\dd=-F$ gives the stated right-hand side. For \eqref{eq:sqp-mu}: the
+divergence row of $J\B-F$ is $\nabla\cdot\B-\nabla\cdot\B=0$, so
+Proposition~\ref{prop:schur} applies unchanged, and the quadratic row is
+$\Tr(|\B|^2)-\Tr q=\Tr(2q+1)-\Tr q=\Tr q+1$.
+\end{proof}
+
+Equivalently, in tangent-gradient form: the $\Wm^{-2}$-metric projection of
+$\nabla R$ onto $\ker J$ is $\B-\Wm^{-2}J^{\!\top}m$ with
+$(J\Wm^{-2}J^{\!\top})m=J\Wm^{-2}\nabla R=J\B$, so that
+$\dd=-(\B-\Wm^{-2}J^{\!\top}m)$ is minus the tangential gradient of $R$. The
+two coincide at a converged state, where $F=0$; away from it, \eqref{eq:sqp}
+also restores feasibility to first order. In practice we take a damped step
+$\B\leftarrow\B+\alpha\dd$ ($\alpha\approx0.3$) followed by a Gauss--Newton
+retraction (Section~\ref{sec:galerkin}) back onto the manifold, and accept the
+pair only if $R$ decreases while the pinned energies and the residual return
+to tolerance.
+
+\begin{remark}[the $s=0$ degeneracy]\label{rem:s0}
+At $s=0$ the functional is constant on the manifold, $R=\tfrac12\|\B\|^2$ with
+$\|\B\|^2=\langle|\B|^2\rangle=1$, so no descent exists --- and the algebra
+reproduces this exactly: with $\Wm^{-2}=\mathsf I$ and $\Tr q=0$,
+\eqref{eq:sqp-mu} is $\Aop\mu=1$, which is solved by $\mu\equiv1$ because
+$\Aop1=\B\cdot\Pl\B=|\B|^2=1$; then
+$\dd=-\B+\Pl\B=-\B+\B=0$. The descent is only meaningful for $s>0$.
+\end{remark}
+
+\begin{remark}[pins are mandatory here]\label{rem:pins-descent}
+Without the energy rows of \eqref{eq:bordered} the descent has an obvious
+global attractor: among constant-$|\B|$ states with a given mean, the
+smoothest are the 1D circularly polarised waves of lowest wavenumber, so the
+unconstrained descent degenerates toward 1D circular polarisation and answers
+nothing. Included, the rows hold a genuinely 3D anchor fixed
+(Lemma~\ref{lem:pin}) while the rest of the spectrum is allowed to relax, and
+the limit of the descent is a candidate answer to the minimal-dressing (or
+``quenching'') question: what is the least spectral tail compatible with a
+prescribed 3D core? The module is marked experimental --- correctness over
+speed, an un-jitted CG loop over jitted matvecs --- because the retraction and
+the border interact in ways we have not yet characterised.
+\end{remark}
+
+\section{The continuation driver}\label{sec:driver}
+
+The driver (\texttt{grow.py}) walks the seed amplitude upward, re-converging
+after every push, and refines the grid when --- and only when --- the honest
+diagnostics say the state has outgrown it. Algorithm~\ref{alg:grow} is the
+loop.
+
+\begin{algorithm}[htbp]
+\caption{Carrier-free continuation (\texttt{grow.py})}
+\label{alg:grow}
+\small
+\begin{algorithmic}[1]
+\State $\B\gets\bar\B$ (uniform); refuse if \texttt{fix-mean} and
+$|\bar\B|\ge1-10^{-9}$ \Comment{Corollary~\ref{cor:mean}}
+\State build seed $\bb=\Trr\nabla\times\mathbf a$, $\max|\bb|=1$; record its
+spec in the state metadata
+\State if \texttt{freeze-top} $m>0$: freeze the $m$ dominant bins of $\hat\bb$
+(plus $\kk=0$ if \texttt{fix-mean}); report the triples and the
+non-coplanarity verdict \Comment{Lemma~\ref{lem:pin}}
+\State $\B\gets\Trr\Pl\B$ \Comment{project once, \eqref{eq:project}}
+\State $\epsilon\gets0$; $\delta\gets\delta_0$; $c\gets0$
+\While{$\epsilon<\epsilon_{\max}$ and time remains}
+  \State $\B_{\text{trial}}\gets\B+\delta\,\bb$ \Comment{$\bb$ rebuilt on the
+  current grid from metadata}
+  \State $(\B_{\text{trial}},r,\texttt{cg})\gets\textsc{GaussNewton}
+  (\B_{\text{trial}})$ \Comment{\eqref{eq:step-G}, a few sweeps}
+  \If{$r>r_{\text{ok}}$} \Comment{no salvage: quadratic Newton means a bad
+  step is genuinely bad}
+    \State $\delta\gets\delta/2$; $c\gets0$
+    \If{$\delta<\delta_{\min}$} \State \textbf{stop:} \textsc{Fold candidate}
+    \EndIf
+    \State \textbf{continue}
+  \EndIf
+  \State $\B\gets\B_{\text{trial}}$; $\epsilon\gets\epsilon+\delta$;
+  $c\gets c+1$
+  \State record diagnostics (Section~\ref{sec:bookkeeping}) to CSV; snapshot
+  every $\Delta\epsilon_{\text{snap}}$
+  \If{$\texttt{gal\_tail\_rms}>\tau_{\text{tail}}$ \textbf{or}
+      $\texttt{edge}>\tau_{\text{edge}}$} \Comment{honest-tail / band-edge
+      triggers}
+    \If{grid $=$ \texttt{grid-max}} \State \textbf{stop:}
+      \textsc{Sharpening} \EndIf
+    \State grid $\gets\min(1.5\times\text{grid},\texttt{grid-max})$;
+      $\B\gets\textsc{ZeroPad}(\B)$; re-polish with extra sweeps and report if
+      $r_{\text{ok}}$ is not met
+    \State $c\gets0$
+  \EndIf
+  \If{$c\ge2$} \State $\delta\gets\min(1.3\,\delta,\delta_{\max})$;
+  $c\gets0$ \EndIf
+\EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+Three features of Algorithm~\ref{alg:grow} are not tuning choices.
+
+\paragraph{The ladder ascends, never descends.} Refinement is always
+zero-padding a converged state to a finer grid and re-polishing. The reverse
+operation --- truncating a fine state and re-converging --- is forbidden,
+because it lets the solver relax onto a different, smoother member of the
+solution family: it was observed to do exactly that at $\epsilon=0.98$ on a
+$32^2\times64$ ladder rung. An ascending ladder tracks one continuum object;
+a descending one silently changes the subject.
+
+\paragraph{There is no salvage branch.} With quadratic convergence
+(Theorem~\ref{thm:quad}), a step that has not reached $r_{\text{ok}}$ after
+the allotted sweeps is not a step that needs more sweeps; it is a step that
+was too large. The response is to reject, halve $\delta$, and retry. Repeated
+halving to $\delta_{\min}$ is reported as a \textsc{Fold candidate}: the
+continuation cannot proceed at any resolvable step size, which is the
+numerical signature of a turning point in the path.
+
+\paragraph{Refinement triggers are mode-specific.} In Galerkin mode the
+grid's top modes are identically zero, so the classical ``field content near
+the Nyquist frequency'' trigger is blind. The v2 triggers are the honest tail
+(\texttt{gal\_tail\_rms}, Proposition~\ref{prop:tail}) and the field's content
+at the retained-band edge. Exhausting the top grid while the tail still grows
+is the \textsc{Sharpening} stop: the state is demanding resolution faster than
+the ladder can supply it, which is evidence about the solution, not about the
+solver.
+
+\subsection{Amplitude bookkeeping}\label{sec:bookkeeping}
+
+The continuation parameter $\epsilon=\sum\delta$ is a \emph{path label}: the
+accumulated injected seed amplitude. It is not a property of the state, and
+two paths at the same $\epsilon$ are not comparable. The state properties
+recorded per accepted step are the fluctuation level
+$\texttt{fluct\_rms}=\mathrm{rms}\,|\B-\bar\B|$, the drift $1-|\bar\B|$, the
+maximum deflection from $\bar\B$, the reversed volume fraction, the maximum
+gradient, the residual $\max|\Tr q|$, the tail norms, the band-edge content,
+the CG count, and the inertia ratios $\lambda_2/\lambda_1$,
+$\lambda_3/\lambda_1$ of \eqref{eq:inertia}. Note that at convergence the
+$\kk=0$ component of $\Tr q$ vanishes, so $\langle|\B|^2\rangle=1$ exactly and
+\eqref{eq:energy} holds: $\texttt{fluct\_rms}^2=1-|\bar\B|^2$. The two
+amplitude measures are therefore \emph{not} independent, and with a fixed mean
+field neither of them moves at all --- which is precisely why $\epsilon$,
+the gradient measures, and the tail measures are all logged separately.
+
+\section{Practical notes}\label{sec:practical}
+
+\paragraph{Float64 is mandatory.} The CG stop is
+$\|r\|^2<10^{-26}\|r_0\|^2$, i.e.\ relative residual $10^{-13}$, and
+Theorem~\ref{thm:quad} takes the Newton residual to $10^{-15}$ in four sweeps;
+neither is meaningful in single precision. \texttt{jax.config} enables x64
+once, in the package \texttt{\_\_init\_\_}, before anything else touches JAX.
+\texttt{jax-metal} has no x64 support, so Mac GPUs are not a target; the P100's
+$1{:}2$ fp64 throughput is adequate.
+
+\paragraph{One compiled program per solve.} The sweep loop and the CG loop are
+both \texttt{lax.while\_loop}s inside a single \texttt{jax.jit}, so a
+multi-sweep solve runs on-device with no per-iteration host dispatch.
+Code-path flags are static Python booleans (a handful of compiled variants per
+grid shape); numeric knobs (\texttt{sweeps}, \texttt{cgit}, \texttt{tol}) are
+traced, so changing them does not recompile. Buffer donation is not used
+anywhere in v2: it deletes caller arrays, and the continuation driver keeps
+the previous state alive for rejection.
+
+\paragraph{The Nyquist convention.} Derivative wavenumbers zero the
+$|k_i|=N_i/2$ bins, because $i\kk$ makes the self-conjugate Nyquist planes
+anti-Hermitian and a real inverse transform discards their contribution; the
+$k^2$-only quantities (the weight $\Wm^{\pm2}$, the preconditioner
+\eqref{eq:pc}) keep the true Nyquist values. Mixing the two conventions
+corrupts divergence residuals of states with near-Nyquist content by orders of
+magnitude. In Galerkin mode the retained band excludes the Nyquist planes
+anyway, but the operators are shared with the legacy collocation path.
+
+\paragraph{Memory.} A solve holds the state, the seed and the CG workspace
+(the scalar fields $\mu,r,z,p$ plus transform scratch); the dominant term is
+the batched complex half-spectrum of a three-component field,
+$3N_xN_y(N_z/2+1)$ complex doubles. The legacy coupled solver peaks near
+$5$\,GB at $192^2\times384$, which fits a $16$\,GB P100; the $\mu$-only solver
+carries one scalar unknown instead of four fields and is strictly smaller.
+
+\paragraph{Seeds are grid-independent.} Random seed coefficients are drawn
+from a generator keyed by the \emph{integer wavevector} and the run key, not
+by array index, so the same key produces the same continuum field on every
+grid. This is what makes a ladder rung's re-seeded push identical to the
+previous rung's, up to resolution: a seed built on $24^2\times48$ is the
+zero-padding of the same seed built on $16^2\times32$ wherever both resolve
+it. Without this the ladder would perturb the state every time it refined.
+
+\paragraph{Mode compatibility.} Galerkin and collocation runs are not mutually
+resumable: the residuals mean different things and the CSV schemas differ.
+Start fresh state and CSV files when switching.
+
+\section*{Summary of the equations the code implements}
+
+The hot path applies, in order: $\Pl_\Wm\vv:=\Wm^{-2}\Zf\Trr\Pl\vv$ (one
+batched transform pair); the normal operator
+$\Aop\mu=\Tr[\B\cdot\Pl_\Wm(\mu\B)]$, equation~\eqref{eq:step-G}; the
+preconditioner $\Minv=\Tr(1+k^2)^{s}$, equation~\eqref{eq:pc}; the CG
+right-hand side $-\Tr q$ for a solve step and $\Tr q+1$ for a descent step,
+equation~\eqref{eq:sqp-mu}; and the sweep
+$\B\leftarrow\Trr(\B+\Pl_\Wm(\mu\B))$, whose truncation is a no-op by
+Theorem~\ref{thm:quad} and is kept only as a guard.
+
+\begin{question}
+The measurements of Section~\ref{sec:legacy} identify the coupled system, not
+operator projection, as the source of the legacy limit cycle, but do so by
+comparing two implementations that differ in more than one respect. A minimal
+reproducer --- the coupled system with an unbounded CG budget, and the
+$\mu$-only system with a truncated one --- would settle it.
+\end{question}
+
+\end{document}
