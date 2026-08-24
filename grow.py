@@ -152,9 +152,16 @@ def _write_row(fn, row, fresh):
         w.writerow(row)
 
 
+def _snap_prefix(state):
+    """Snapshots are named after the STATE FILE's basename, so two runs
+    sharing a directory (e.g. /kaggle/working) never interleave snapshots
+    and --plot never mixes them."""
+    root = os.path.splitext(os.path.abspath(state))[0]
+    return root + "_eps"
+
+
 def _snap_name(state, eps):
-    return os.path.join(os.path.dirname(os.path.abspath(state)),
-                        f"grow_eps{eps:.2f}.npz")
+    return f"{_snap_prefix(state)}{eps:.2f}.npz"
 
 
 # ---------------------------------------------------------------------------
@@ -358,14 +365,16 @@ def make_plot(args):
     import matplotlib.pyplot as plt
     from constantB.spectra import plot_spectra
 
-    snaps = sorted(glob.glob(os.path.join(
-        os.path.dirname(os.path.abspath(args.state)), "grow_eps*.npz")))
+    snaps = sorted(glob.glob(_snap_prefix(args.state) + "*.npz"))
+    if not snaps:                                 # pre-fix runs used grow_eps*
+        snaps = sorted(glob.glob(os.path.join(
+            os.path.dirname(os.path.abspath(args.state)), "grow_eps*.npz")))
     if snaps:
         out = args.fig_out.replace(".png", "_spectra.png")
         plot_spectra(snaps, out)
         print(f"wrote {out}  ({len(snaps)} snapshots)")
     else:
-        print("no grow_eps*.npz snapshots found; skipping the spectra figure")
+        print("no snapshot .npz found beside --state; skipping the spectra figure")
 
     rows = list(csv.DictReader(open(args.csv)))
     eps = np.array([float(r["eps"]) for r in rows])
