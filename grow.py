@@ -46,6 +46,13 @@ the grid (ascending x1.5 ladder, zero-pad, re-polish) when the Galerkin tail or
 the retained-band edge content gets too big; halve de on a rejected step
 (underflow => FOLD CANDIDATE); regrow de after two clean accepts.
 
+--fixed-res (2026-08-26 scheme) grows on the starting grid for the whole
+quest: the refine triggers are logged but not enforced and there is no
+sharpening stop, so N_grow becomes the single member-selector parameter.
+The selected member differs from the trigger-schedule one (measured:
+smoother); audit every endpoint with an ascending polish ladder (rule 7),
+and never splice fixed-res segments into trigger-schedule CSVs.
+
 RESUMABLE: the state .npz carries B, eps and the full meta (seed spec, smooth,
 fix_mean, freeze and pin lists -- the pin TARGETS are not stored, they are
 recomputed from the rebuilt seed on whatever grid the run resumes at, because
@@ -237,8 +244,14 @@ def run(args):
         freeze_on = eps >= freeze_after
         S = MuSolver(grid, smooth=smooth, fix_mean=fix_mean,
                      freeze=(freeze if freeze_on else []), pins=pins)
-        de0 = float(meta["de"]) if "de" in meta else args.de
+        de_stored = float(meta["de"]) if "de" in meta else 0.03
+        if args.de is not None and args.de != de_stored:
+            print(f"  --de {args.de:g} overrides the stored step "
+                  f"{de_stored:.5f}")
+        de0 = args.de if args.de is not None else de_stored
         streak0 = int(meta["streak"]) if "streak" in meta else 0
+        fixed_res = bool(args.fixed_res) or \
+            ("fixed_res" in meta and bool(np.asarray(meta["fixed_res"])))
     else:
         Bbar0 = np.array(args.Bbar, float)
         nb0 = float(np.linalg.norm(Bbar0))
@@ -269,13 +282,14 @@ def run(args):
             return 2
         grid = tuple(args.grid0)
         smooth, fix_mean = float(args.smooth), bool(args.fix_mean)
-        de0, streak0 = args.de, 0
+        de0, streak0 = (args.de if args.de is not None else 0.03), 0
+        fixed_res = bool(args.fixed_res)
         seed0, meta = _build_seed(args, MuSolver(grid, smooth=smooth,
                                                  fix_mean=fix_mean))
         freeze_after = max(float(args.freeze_after), 0.0)
         meta.update(Bbar=Bbar0, smooth=smooth, fix_mean=fix_mean,
                     freeze=np.zeros((0, 3), int), freeze_after=freeze_after,
-                    pins=np.zeros((0, 3), int))
+                    pins=np.zeros((0, 3), int), fixed_res=fixed_res)
         freeze, pins = [], []
         if args.pin_top > 0:
             pins = [tuple(int(v) for v in t)
@@ -326,7 +340,13 @@ def run(args):
 
     seed = np.asarray(make_seed(meta, S), float)
     e_seed = _pin_schedule(S, seed)
-    grids = _ladder(B.shape[1:], tuple(args.grid_max))
+    if fixed_res:
+        grids = [tuple(B.shape[1:])]
+        print(f"fixed-res mode: growing at {grids[0]} for the whole quest -- "
+              "gtail/edge are logged, not enforced; no sharpening stop. "
+              "Audit the endpoint with an ascending polish ladder (rule 7).")
+    else:
+        grids = _ladder(B.shape[1:], tuple(args.grid_max))
     de, streak, stop = de0, streak0, ""
     fresh = not os.path.exists(args.csv)
     if not fresh:                          # review m10: schema drift warning
@@ -386,7 +406,8 @@ def run(args):
             snap_next += args.snap_de
 
         # ---- adapt: resolution first, then step size ------------------------
-        if d["gal_tail_rms"] > args.gtail_max or d["edge"] > args.edge_max:
+        if (not fixed_res) and (d["gal_tail_rms"] > args.gtail_max
+                                or d["edge"] > args.edge_max):
             cur = grids.index(tuple(B.shape[1:])) \
                 if tuple(B.shape[1:]) in grids else 0
             if cur + 1 >= len(grids):
@@ -513,7 +534,19 @@ def build_parser():
     p.add_argument("--key", type=int, default=0)
     p.add_argument("--seed-file", default="a.npz")
     p.add_argument("--eps-max", type=float, default=3.0)
-    p.add_argument("--de", type=float, default=0.03)
+    p.add_argument("--fixed-res", action="store_true",
+                   help="fixed-resolution growth (2026-08-26 scheme): stay on "
+                        "the starting grid for the whole quest -- the refine "
+                        "triggers (--gtail-max/--edge-max) are logged but not "
+                        "enforced, and there is no sharpening stop. N_grow is "
+                        "then the single member-selector parameter; audit the "
+                        "endpoint with an ascending polish ladder (rule 7). "
+                        "Recorded in the state, so resumes stay fixed-res "
+                        "without the flag.")
+    p.add_argument("--de", type=float, default=None,
+                   help="initial step (default 0.03). On RESUME an explicitly "
+                        "passed --de overrides the step stored in the state "
+                        "(historically it was silently ignored).")
     p.add_argument("--de-min", type=float, default=1e-4)
     p.add_argument("--de-max", type=float, default=0.08)
     p.add_argument("--sweeps", type=int, default=8)
