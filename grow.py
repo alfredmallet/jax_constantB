@@ -365,9 +365,12 @@ def run(args):
         # Targets for the eps this step is REACHING (traced: no recompile when
         # a rejection halves de and the schedule value changes).
         tgt = (eps + de) ** 2 * e_seed if pins else None
+        # donate: the input is a fresh host-numpy expression and the
+        # rejection fallback is `Bprev`, host numpy -- nothing device-side to
+        # invalidate (solver_mu.gn docstring).
         Btry, res, ci = S.gn(np.asarray(B) + de * seed, sweeps=args.sweeps,
                              cgit=args.cgit, tol=args.res_ok * 1e-2,
-                             pin_targets=tgt)
+                             pin_targets=tgt, donate=True)
         pin_err = S.pin_error(Btry, tgt, relative=True) if pins else 0.0
         if res > args.res_ok or pin_err > _PIN_ERR_MAX:
             # No salvage: mu-form GN is quadratically convergent, so a residual
@@ -426,7 +429,8 @@ def run(args):
             tgt = eps ** 2 * e_seed if pins else None
             rin = max(float(np.abs(np.asarray(r)).max()) for r in S.residual(Bf))
             Bp, res2, _ = S.gn(Bf, sweeps=args.sweeps + 4, cgit=args.cgit,
-                               tol=args.res_ok * 1e-2, pin_targets=tgt)
+                               tol=args.res_ok * 1e-2, pin_targets=tgt,
+                               donate=True)   # Bf is dead after this line
             B = np.asarray(Bp)
             pe2 = S.pin_error(B, tgt, relative=True) if pins else 0.0
             print(f"   [refined {old} -> {new}; incoming honest residual "

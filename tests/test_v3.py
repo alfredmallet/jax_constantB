@@ -225,7 +225,7 @@ def _sym_defect(S, B, rng):
     operator image and preconditioner are all band projected), so this is
     symmetry ON THE SUBSPACE the solve actually lives in.
     """
-    op = (S.KR, S.maskR, S.freezeR, S.Wm2r, S.invK2)
+    op = (S.grid1d, S.freeze_idx)
     G = _pin_fields(np.asarray(B), S.pinR)
     m = int(np.asarray(S.pinR).shape[0])
     xs, ys = [], []

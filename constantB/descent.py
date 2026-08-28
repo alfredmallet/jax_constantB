@@ -101,7 +101,7 @@ def sqp_step(S, B, pins, alpha=0.3):
     # arrays ARE the operator's arrays, so the tangent solve below and the
     # retraction cannot disagree about a pin.
     Sp = MuSolver(S.shape, smooth=S.smooth, pins=pins)
-    op = (Sp.KR, Sp.maskR, Sp.freezeR, Sp.Wm2r, Sp.invK2)
+    op = (Sp.grid1d, Sp.freeze_idx)      # the solver's own kernel arguments
     B = jnp.asarray(Sp.trunc3(B))
 
     G = _pin_fields_jit(B, Sp.pinR)                    # (m, 3, ...)
@@ -116,9 +116,9 @@ def sqp_step(S, B, pins, alpha=0.3):
     dnu = _pin_precond_jit(G, *op)                     # nu-block precond diag
 
     # rhs = J B - F = ( T q + 1, 2 e ) -- the SQP right-hand side.
-    r_mu, r_nu = _tq_jit(B, Sp.maskR) + 1.0, jnp.asarray(2.0 * e)
+    r_mu, r_nu = _tq_jit(B, Sp.grid1d) + 1.0, jnp.asarray(2.0 * e)
     mu, nu = jnp.zeros_like(r_mu), jnp.zeros(m)
-    z_mu, z_nu = _minv_jit(r_mu, Sp.maskR, Sp.W2r), r_nu / dnu
+    z_mu, z_nu = _minv_jit(r_mu, Sp.grid1d), r_nu / dnu
     p_mu, p_nu = z_mu, z_nu
     rz = _dot(r_mu, z_mu) + _dot(r_nu, z_nu)
     rr0 = _dot(r_mu, r_mu) + _dot(r_nu, r_nu)
@@ -132,7 +132,7 @@ def sqp_step(S, B, pins, alpha=0.3):
         r_mu, r_nu = r_mu - al * a_mu, r_nu - al * a_nu
         if _dot(r_mu, r_mu) + _dot(r_nu, r_nu) < _CG_RTOL * rr0:
             break
-        z_mu, z_nu = _minv_jit(r_mu, Sp.maskR, Sp.W2r), r_nu / dnu
+        z_mu, z_nu = _minv_jit(r_mu, Sp.grid1d), r_nu / dnu
         rz2 = _dot(r_mu, z_mu) + _dot(r_nu, z_nu)
         p_mu, p_nu = z_mu + (rz2 / rz) * p_mu, z_nu + (rz2 / rz) * p_nu
         rz = rz2

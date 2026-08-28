@@ -54,6 +54,21 @@ def wavenumbers(shape):
     return jnp.stack(jnp.meshgrid(*[jnp.asarray(k) for k in ks], indexing="ij"))
 
 
+def _axis_k(n, freqs, zero_nyquist):
+    """One axis of the rfft wavenumber layout, Nyquist optionally zeroed."""
+    k = freqs.copy()
+    if zero_nyquist and n % 2 == 0:
+        k[np.abs(np.abs(k) - n / 2) < _STRICT] = 0.0
+    return k
+
+
+def _rfft_axes(shape, zero_nyquist=False):
+    """The three 1D rfft-layout wavenumber axes (host numpy)."""
+    return [_axis_k(shape[0], _freqs(shape[0]), zero_nyquist),
+            _axis_k(shape[1], _freqs(shape[1]), zero_nyquist),
+            _axis_k(shape[2], _rfreqs(shape[2]), zero_nyquist)]
+
+
 def rfft_wavenumbers(shape, zero_nyquist=False):
     """(3, Nx, Ny, Nz//2+1) stacked wavenumber grids, rfftn layout (jax).
 
@@ -69,16 +84,34 @@ def rfft_wavenumbers(shape, zero_nyquist=False):
     and the Sobolev weight -- keep the true Nyquist values (matching the
     reference), so they use zero_nyquist=False.
     """
-    def axis(n, freqs):
-        k = freqs.copy()
-        if zero_nyquist and n % 2 == 0:
-            k[np.abs(np.abs(k) - n / 2) < _STRICT] = 0.0
-        return k
-
-    ks = [axis(shape[0], _freqs(shape[0])),
-          axis(shape[1], _freqs(shape[1])),
-          axis(shape[2], _rfreqs(shape[2]))]
+    ks = _rfft_axes(shape, zero_nyquist)
     return jnp.stack(jnp.meshgrid(*[jnp.asarray(k) for k in ks], indexing="ij"))
+
+
+def axis_wavenumbers_1d(shape, zero_nyquist=False):
+    """Three float64 arrays shaped (Nx,1,1), (1,Ny,1), (1,1,Nz//2+1): the
+    rfft-layout wavenumbers as broadcastable 1D factors.
+
+    Same Nyquist-zeroing rule as `rfft_wavenumbers`, of which this is the
+    separable form: `jnp.stack(jnp.broadcast_arrays(*axis_wavenumbers_1d(...)))`
+    reproduces it bin for bin.  O(N) storage instead of O(N^3), so the solver
+    carries these and fuses the outer products into the kernels that use them.
+    """
+    ks = _rfft_axes(shape, zero_nyquist)
+    return (jnp.asarray(ks[0])[:, None, None],
+            jnp.asarray(ks[1])[None, :, None],
+            jnp.asarray(ks[2])[None, None, :])
+
+
+def axis_masks_1d(shape):
+    """Three float64 {0,1} arrays, same shapes as `axis_wavenumbers_1d`: the
+    strict |k| < N/3 axis masks whose product is `dealias_mask_rfft`."""
+    ms = [_axis_mask(shape[0], _freqs(shape[0])),
+          _axis_mask(shape[1], _freqs(shape[1])),
+          _axis_mask(shape[2], _rfreqs(shape[2]))]
+    return (jnp.asarray(ms[0].astype(float))[:, None, None],
+            jnp.asarray(ms[1].astype(float))[None, :, None],
+            jnp.asarray(ms[2].astype(float))[None, None, :])
 
 
 def numpy_wavenumbers(shape):
