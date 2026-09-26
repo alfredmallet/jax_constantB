@@ -187,7 +187,7 @@ def run_one(a, ops, seed):
     phi = jnp.zeros((a.N, a.N))
     dx = 1.0 / a.N
     t, nextA, rows, T0 = 0.0, a.A0, [], time.time()
-    tag = f"N{a.N}_s{seed}_th{int(a.th)}_k{a.kcut}" + ("_fp32" if FP32 else "")
+    tag = f"N{a.N}_s{seed}_th{int(a.th)}_k{a.kcut}" + ("_fp32" if FP32 else "") + (f"_cg{a.cgit}" if a.cgit != 300 else "")
     snaps = {}
     umax = 0.0
     Bbar = ops["Bbar"]
@@ -232,10 +232,11 @@ def main():
     ap.add_argument("--kcut", type=int, default=1)
     ap.add_argument("--gamma", type=float, default=0.0)
     ap.add_argument("--dtmax", type=float, default=0.01)
+    ap.add_argument("--cgit", type=int, default=300, help="CG iteration cap per solve")
     ap.add_argument("--out", default="sm22_out")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    ops = build(a.N, np.deg2rad(a.th), 1.0, gamma=a.gamma, cg_tol=1e-5 if FP32 else 1e-11)
+    ops = build(a.N, np.deg2rad(a.th), 1.0, gamma=a.gamma, cg_iters=a.cgit, cg_tol=1e-5 if FP32 else 1e-11)
     if a.seeds is None:
         seeds = [a.seed]
     elif "-" in a.seeds:
@@ -243,7 +244,7 @@ def main():
     else:
         seeds = [int(x) for x in a.seeds.split(",")]
     for s in seeds:
-        tag = f"N{a.N}_s{s}_th{int(a.th)}_k{a.kcut}" + ("_fp32" if FP32 else "")
+        tag = f"N{a.N}_s{s}_th{int(a.th)}_k{a.kcut}" + ("_fp32" if FP32 else "") + (f"_cg{a.cgit}" if a.cgit != 300 else "")
         if os.path.exists(os.path.join(a.out, f"series_{tag}.npz")):
             print(f"[{tag}] exists, skipping", flush=True); continue
         run_one(a, ops, s)

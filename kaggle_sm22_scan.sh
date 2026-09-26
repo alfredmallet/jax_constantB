@@ -6,12 +6,14 @@
 #   !pip install -q -U "jax[cuda12]"
 #   !git clone https://github.com/alfredmallet/jax_constantB.git /kaggle/working/jax_constantB
 #   %cd /kaggle/working/jax_constantB
-#   !bash kaggle_sm22_scan.sh 8-107 128 1.2
-SEEDS=${1:-8-57}; N=${2:-128}; AMAX=${3:-1.2}
+#   !bash kaggle_sm22_scan.sh 8-107 128 1.2 100   # seeds N Amax CGcap
+# CG cap: the solve plateaus (LSQ residual floor) and hits any cap; caps 50/100 match 300 at
+# N=64 fp32 (maxgrad <=5e-3, Lambda99 peak and |B|^2 error identical). Default 100 for N>=128.
+SEEDS=${1:-8-57}; N=${2:-128}; AMAX=${3:-1.2}; CGIT=${4:-100}
 lo=${SEEDS%-*}; hi=${SEEDS#*-}; mid=$(( (lo + hi) / 2 ))
 OUT=/kaggle/working/sm22_scan_N$N; mkdir -p $OUT
 export SM22_FP32=1 XLA_PYTHON_CLIENT_PREALLOCATE=false
-CUDA_VISIBLE_DEVICES=0 python3 -u sm22_batch.py --N $N --seeds $lo-$mid       --Amax $AMAX --out $OUT > $OUT/gpu0.log 2>&1 &
-CUDA_VISIBLE_DEVICES=1 python3 -u sm22_batch.py --N $N --seeds $((mid+1))-$hi --Amax $AMAX --out $OUT > $OUT/gpu1.log 2>&1 &
+CUDA_VISIBLE_DEVICES=0 python3 -u sm22_batch.py --N $N --seeds $lo-$mid       --Amax $AMAX --cgit $CGIT --out $OUT > $OUT/gpu0.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 python3 -u sm22_batch.py --N $N --seeds $((mid+1))-$hi --Amax $AMAX --cgit $CGIT --out $OUT > $OUT/gpu1.log 2>&1 &
 wait
 cd /kaggle/working && tar czf sm22_scan_N$N.tgz sm22_scan_N$N

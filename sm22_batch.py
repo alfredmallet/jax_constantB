@@ -27,17 +27,18 @@ def main():
     ap.add_argument("--Amax", type=float, default=1.2)
     ap.add_argument("--kcut", type=int, default=1)
     ap.add_argument("--dtmax", type=float, default=0.01)
+    ap.add_argument("--cgit", type=int, default=300, help="CG iteration cap per solve")
     ap.add_argument("--out", default="sm22_out")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     th = np.deg2rad(a.th); B0 = 1.0; dx = 1.0 / a.N
-    sfx = "_fp32" if FP32 else ""
+    sfx = ("_fp32" if FP32 else "") + (f"_cg{a.cgit}" if a.cgit != 300 else "")
     tags = {s: f"N{a.N}_s{s}_th{int(a.th)}_k{a.kcut}{sfx}" for s in parse_seeds(a.seeds)}
     seeds = [s for s in tags if not os.path.exists(os.path.join(a.out, f"series_{tags[s]}.npz"))]
     if not seeds:
         print("all seeds done"); return
     S = len(seeds)
-    ops = build(a.N, th, B0, cg_tol=1e-5 if FP32 else 1e-11)
+    ops = build(a.N, th, B0, cg_iters=a.cgit, cg_tol=1e-5 if FP32 else 1e-11)
     Bbar = ops["Bbar"]
     step = jax.jit(jax.vmap(ops["rk4"], in_axes=(0, 0, 0)))
 
