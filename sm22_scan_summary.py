@@ -4,7 +4,7 @@ import sys, glob, re, os, numpy as np
 from sm22_zray import analyse
 d = sys.argv[1]; N = int(sys.argv[2]) if len(sys.argv) > 2 else 64
 rows = []
-for f in sorted(glob.glob(f"{d}/snaps_N{N}_s*_th30_k1.npz"), key=lambda p: int(re.findall(r"_s(\d+)_", p)[0])):
+for f in sorted(glob.glob(f"{d}/snaps_N{N}_s*_th30_k1*.npz"), key=lambda p: int(re.findall(r"_s(\d+)_", p)[0])):
     s = int(re.findall(r"_s(\d+)_", f)[0])
     z = np.load(f); ser = np.load(f.replace("snaps_", "series_"))
     AZ = ser["A"][np.argmax(ser["zfrac"] > 0)] if (ser["zfrac"] > 0).any() else np.nan

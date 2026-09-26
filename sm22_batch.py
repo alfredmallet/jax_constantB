@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--kcut", type=int, default=1)
     ap.add_argument("--dtmax", type=float, default=0.01)
     ap.add_argument("--cgit", type=int, default=300, help="CG iteration cap per solve")
+    ap.add_argument("--snapmin", type=float, default=0.0, help="only store snapshots with A >= this")
     ap.add_argument("--out", default="sm22_out")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -59,7 +60,8 @@ def main():
         for i in np.nonzero(~done)[0]:
             if A[i] >= nextA[i] or A[i] >= a.Amax:
                 Bi = np.asarray(B[i]); d = diagnostics(Bi, ops, B0); d.update(umax=float(umax[i]))
-                rows[i].append(d); snaps[i][f"A{d['A']:.3f}"] = Bi
+                rows[i].append(d)
+                if d['A'] >= a.snapmin: snaps[i][f"A{d['A']:.3f}"] = Bi
                 print(f"[{tags[seeds[i]]}] A={d['A']:.3f} Berr={d['Berr']:.2e} maxgrad={d['maxgrad']:.2f} "
                       f"Z={d['zfrac']:.3f} top|w|={d['top_absw']:.3f}/{d['all_absw']:.3f} "
                       f"step {nstep} ({time.time()-T0:.0f}s)", flush=True)
