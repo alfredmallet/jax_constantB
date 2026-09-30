@@ -88,6 +88,9 @@ def _taranis_grow(p, st, targets, scheme_name, max_steps=20000, wall_cap=None):
 
 
 def tar2d(N, seed, out, scheme="lsrk54"):
+    # sm22_grow2d (for seed_state) sets jax_enable_x64 from SM22_FP32 at import: keep it
+    # consistent with TARANIS_PRECISION, or an inherited SM22_FP32=1 silently turns x64 off
+    os.environ["SM22_FP32"] = "0" if os.environ.get("TARANIS_PRECISION", "32") == "64" else "1"
     import jax.numpy as jnp
     import taranis
     from sm22_grow2d import seed_state
