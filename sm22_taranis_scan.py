@@ -1,6 +1,6 @@
 """Onset-amplitude scans A_c(p) over low-dimensional IC families, on taranis SM22 (branch sm22).
 
-  python sm22_taranis_scan.py fam2d FAM TH_DEG N OUTDIR [NPSI]   # 2D two-mode family, psi grid
+  python sm22_taranis_scan.py fam2d FAM TH_DEG N OUTDIR [NPSI | K0:K1:DEN]   # 2D two-mode family
   python sm22_taranis_scan.py dense3d N OUTDIR                    # the round-1/2 9-mode 3D IC, dense A
 
 fam2d: Ax = cos(psi) cos(2pi k1.x) + sin(psi) cos(2pi k2.x), psi in [0, pi/2] (NPSI points, ends
@@ -18,7 +18,7 @@ import json, os, sys, time
 import numpy as np
 
 A0 = 0.05
-T2D = [round(0.3 + 0.05*i, 2) for i in range(35)]          # 0.30 ... 2.00
+T2D = [round(0.3 + 0.025*i, 3) for i in range(69)]         # 0.30 ... 2.00 (round 3: step 0.05)
 T3D = [0.1, 0.3, 0.5] + [round(0.75 + 0.025*i, 3) for i in range(11)]
 GUARD_BOUT = 2e-2
 FAMS = {"10_01": ((1, 0), (0, 1)), "10_11": ((1, 0), (1, 1))}
@@ -101,20 +101,67 @@ def warm(g, st):
         g.extra(st)
 
 
-def fam2d(fam, th_deg, N, out, npsi=33):
+def geom2d(B):
+    """Ignorable-component geometry of a 2.5D state B (3, N, N) -- a numpy port of
+    sm22_grow2d.diagnostics' P1 block (w = B_3/|B| reversing ALONG in-plane field lines:
+    Z_bad = {|w| < 0.03, |d_t w| > |d_n w|}), same array/axis convention as seed2d."""
+    N = B.shape[-1]
+    k = 2*np.pi*np.fft.fftfreq(N, 1.0/N)
+    Bh = np.fft.fft2(B)
+    G = np.stack([np.real(np.fft.ifft2(1j*k[:, None]*Bh)), np.real(np.fft.ifft2(1j*k[None, :]*Bh))], 1)
+    Bmag = np.sqrt(np.sum(B**2, 0))
+    gradF = np.sqrt(np.sum(G**2, axis=(0, 1))) / Bmag
+    w = B[2] / Bmag
+    mm = np.sqrt(B[0]**2 + B[1]**2) + 1e-300
+    t = B[:2] / mm
+    gw = G[2] / Bmag
+    dtw = t[0]*gw[0] + t[1]*gw[1]
+    dnw = -t[1]*gw[0] + t[0]*gw[1]
+    Z = np.abs(w) < 0.03
+    zbad = (np.abs(dtw) > np.abs(dnw)) & Z
+    top = gradF >= np.quantile(gradF, 0.995)
+    cos_bad = np.abs(dtw) / (np.sqrt(dtw**2 + dnw**2) + 1e-300)
+    curl = np.stack([G[2, 1], -G[2, 0], G[1, 0] - G[0, 1]])
+    sigma = np.sum(B*curl, 0) / Bmag**2
+    ig = np.unravel_index(np.argmax(gradF), gradF.shape)
+    return dict(zfrac=float(Z.mean()), zbad_frac=float(zbad.sum()/max(Z.sum(), 1)),
+                top_absw=float(np.median(np.abs(w[top]))), all_absw=float(np.median(np.abs(w))),
+                top_cosbad=float(np.median(cos_bad[top])), top_absig=float(np.median(np.abs(sigma[top]))),
+                all_absig=float(np.median(np.abs(sigma))), w_at_peak=float(w[ig]),
+                cosbad_at_peak=float(cos_bad[ig]), ipeak=[int(ig[0]), int(ig[1])])
+
+
+def fam2d(fam, th_deg, N, out, spec="33"):
+    """spec: "NPSI" (linspace over [0, pi/2], ends included; round 3) or "K0:K1:DEN"
+    (psi*2/pi = k/DEN for k = K0..K1: a fixed lattice, so different N / ranges share psi values)."""
     # sm22_grow2d is not imported here, but keep SM22_FP32 consistent anyway (see sm22_taranis_bench)
     os.environ["SM22_FP32"] = "0" if os.environ.get("TARANIS_PRECISION", "32") == "64" else "1"
     import jax.numpy as jnp
     import taranis
+    from taranis import grids
     th = np.deg2rad(th_deg)
+    if ":" in spec:
+        k0, k1, den = (int(a) for a in spec.split(":"))
+        psis = [k/den*np.pi/2 for k in range(k0, k1 + 1)]
+        tag_s = f"_k{k0}-{k1}of{den}"
+    else:
+        psis = list(np.linspace(0, np.pi/2, int(spec))); tag_s = ""
     p = taranis.Parameters(N, N, 1.0, 1.0, 0.5, eqtype="SM22", dims=2, eqpars=dict(maxiter=200))
-    g = Grower(p)
+
+    def extra(st):
+        B = np.stack([np.asarray(grids.ifft(st.fields[i], p), np.float64) for i in range(3)])
+        return geom2d(B.reshape(3, N, N))
+    g = Grower(p, extra=extra)
     mk = lambda psi: taranis.initialize(lambda x, y: jnp.asarray(seed2d(N, th, fam, psi))[:, None], p)
-    warm(g, mk(0.3))
-    tag = f"fam2d_{fam}_th{th_deg:g}_N{N}_fp{os.environ.get('TARANIS_PRECISION', '32')}"
+    st0 = mk(0.3)
+    # layout check: the host reshape must reproduce the seed exactly (else geom2d is mis-indexed)
+    B0 = np.stack([np.asarray(grids.ifft(st0.fields[i], p)) for i in range(3)]).reshape(3, N, N)
+    assert np.max(np.abs(B0 - seed2d(N, th, fam, 0.3))) < 1e-4, "geom2d layout mismatch"
+    warm(g, st0)
+    tag = f"fam2d_{fam}_th{th_deg:g}{tag_s}_N{N}_fp{os.environ.get('TARANIS_PRECISION', '32')}"
     res = []
-    for i, psi in enumerate(np.linspace(0, np.pi/2, npsi)):
-        r = g.grow(mk(psi), T2D, max_steps=6000, wall_cap=240)
+    for i, psi in enumerate(psis):
+        r = g.grow(mk(psi), T2D, max_steps=8000, wall_cap=300)
         r.update(psi=float(psi), i=i)
         res.append(r)
         last = r["rows"][-1] if r["rows"] else {}
@@ -199,6 +246,6 @@ def dense3d(N, out):
 if __name__ == "__main__":
     m = sys.argv[1]
     if m == "fam2d":
-        fam2d(sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5], *(int(a) for a in sys.argv[6:7]))
+        fam2d(sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5], *sys.argv[6:7])
     elif m == "dense3d":
         dense3d(int(sys.argv[2]), sys.argv[3])
