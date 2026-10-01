@@ -2,7 +2,7 @@
 
   python sm22_taranis_scan.py fam2d FAM TH_DEG N OUTDIR [NPSI | K0:K1:DEN]   # 2D two-mode family
   python sm22_taranis_scan.py dense3d N OUTDIR                    # the round-1/2 9-mode 3D IC, dense A
-  python sm22_taranis_scan.py lift3d K3 EPS N OUTDIR [TH_DEG KPSI]  # a 2D tongue state + a 3rd mode
+  python sm22_taranis_scan.py lift3d K3 EPS N OUTDIR [AMAX [TH_DEG KPSI]]  # 2D tongue state + 3rd mode
 
 lift3d: the fam2d "10_01" state (theta=15 deg, psi*2/pi = KPSI/128 = 18/128, the V bottom, 2D A_c=0.6)
 on an N^3 box with (x, y, z) = (l, z_2D, ignorable), plus a third mode chi_3 = cos(2pi k3.x), K3 = "001"
@@ -200,13 +200,38 @@ def f3_ic():
 
 
 def dense3d(N, out):
+    import taranis
+    p = taranis.Parameters(N, N, 1.0, 1.0, 0.5, eqtype="SM22", dims=3, nz=N, Lz=1.0, z_spectral=True,
+                           eqpars=dict(maxiter=300))
+    g, extra = loc_grower(p)
+    st = taranis.initialize(f3_ic(), p)
+    warm(g, st); extra.slices.clear()
+    r = g.grow(st, T3D, wall_cap=3000)
+    tag = f"dense3d_N{N}_fp{os.environ.get('TARANIS_PRECISION', '32')}"
+    save3d(out, tag, r, extra, dict(N=N, targets=T3D))
+
+
+def save3d(out, tag, r, extra, meta):
+    os.makedirs(out, exist_ok=True)
+    np.savez_compressed(os.path.join(out, tag + "_slices.npz"), slices=np.stack(extra.slices),
+                        targets=np.array([row["target"] for row in r["rows"]]))
+    with open(os.path.join(out, tag + ".json"), "w") as f:
+        json.dump(dict(**meta, **r), f)
+    for row in r["rows"]:
+        print(f"[{tag}] A={row['target']} mg={row['maxgrad']:.2f} Bout={row['Berr_out']:.2e} "
+              f"Boutmax={row['Berr_out_max']:.2e} edge={row['edge_max']:.3f} fg={row['fgrad_half']:.2e}",
+              flush=True)
+    print(f"[{tag}] stop={r['stop']} steps={r['steps']} wall={r['wall']:.1f}s", flush=True)
+
+
+def loc_grower(p):
+    """Grower whose extra records the localization of the gradient and out-of-band |B|^2 peaks
+    (argmax positions, volume fractions above max/2, a 2D slice of |grad B|/|B| through the peak)."""
     import jax
     import jax.numpy as jnp
     import taranis
     from taranis import grids
     from taranis.physics import sm22 as P
-    p = taranis.Parameters(N, N, 1.0, 1.0, 0.5, eqtype="SM22", dims=3, nz=N, Lz=1.0, z_spectral=True,
-                           eqpars=dict(maxiter=300))
     kg = taranis.setup_kgrids(p)
 
     @jax.jit
@@ -233,28 +258,13 @@ def dense3d(N, out):
         extra.slices.append(np.asarray(d["slice"], np.float32))
         return r
     extra.slices = []
-    g = Grower(p, extra=extra)
-    st = taranis.initialize(f3_ic(), p)
-    warm(g, st); extra.slices.clear()
-    r = g.grow(st, T3D, wall_cap=3000)
-    tag = f"dense3d_N{N}_fp{os.environ.get('TARANIS_PRECISION', '32')}"
-    os.makedirs(out, exist_ok=True)
-    np.savez_compressed(os.path.join(out, tag + "_slices.npz"), slices=np.stack(extra.slices),
-                        targets=np.array([row["target"] for row in r["rows"]]))
-    with open(os.path.join(out, tag + ".json"), "w") as f:
-        json.dump(dict(N=N, targets=T3D, **r), f)
-    for row in r["rows"]:
-        print(f"[{tag}] A={row['target']} mg={row['maxgrad']:.2f} Bout={row['Berr_out']:.2e} "
-              f"Boutmax={row['Berr_out_max']:.2e} edge={row['edge_max']:.3f} fg={row['fgrad_half']:.2e}",
-              flush=True)
-    print(f"[{tag}] stop={r['stop']} steps={r['steps']} wall={r['wall']:.1f}s", flush=True)
+    return Grower(p, extra=extra), extra
 
 
-T3L = [round(0.3 + 0.025*i, 3) for i in range(29)]          # 0.30 ... 1.00
 K3S = {"001": (0, 0, 1), "011": (0, 1, 1)}
 
 
-def lift3d(k3, eps, N, out, th_deg=15.0, kpsi=18):
+def lift3d(k3, eps, N, out, amax=1.0, th_deg=15.0, kpsi=18):
     import jax.numpy as jnp
     import taranis
     th = np.deg2rad(th_deg); psi = kpsi/128*np.pi/2
@@ -286,17 +296,13 @@ def lift3d(k3, eps, N, out, th_deg=15.0, kpsi=18):
         B3 = np.asarray(f(jnp.asarray(X), jnp.asarray(Y), jnp.asarray(Z)))
         assert np.max(np.abs(B3 - seed2d(N, th, "10_01", psi)[..., None])) < 1e-5, "lift3d != seed2d"
     st = taranis.initialize(f, p)
-    g = Grower(p)
-    warm(g, st)
-    r = g.grow(st, T3L, wall_cap=1500)
-    tag = f"lift3d_k{k3}_eps{eps:g}_th{th_deg:g}_kpsi{kpsi}_N{N}_fp{os.environ.get('TARANIS_PRECISION', '32')}"
-    os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, tag + ".json"), "w") as fh:
-        json.dump(dict(k3=k3, eps=eps, th_deg=th_deg, kpsi=kpsi, N=N, targets=T3L, **r), fh)
-    for row in r["rows"]:
-        print(f"[{tag}] A={row['target']} mg={row['maxgrad']:.2f} Bout={row['Berr_out']:.2e} "
-              f"Boutmax={row['Berr_out_max']:.2e} edge={row['edge_max']:.3f} its={row['its']}", flush=True)
-    print(f"[{tag}] stop={r['stop']} steps={r['steps']} wall={r['wall']:.1f}s", flush=True)
+    g, extra = loc_grower(p)
+    warm(g, st); extra.slices.clear()
+    T = [round(0.3 + 0.025*i, 3) for i in range(int(round((amax - 0.3)/0.025)) + 1)]
+    r = g.grow(st, T, wall_cap=3000)
+    tag = (f"lift3d_k{k3}_eps{eps:g}_th{th_deg:g}_kpsi{kpsi}_A{amax:g}_N{N}"
+           f"_fp{os.environ.get('TARANIS_PRECISION', '32')}")
+    save3d(out, tag, r, extra, dict(k3=k3, eps=eps, th_deg=th_deg, kpsi=kpsi, N=N, targets=T))
 
 
 if __name__ == "__main__":
@@ -307,4 +313,5 @@ if __name__ == "__main__":
         dense3d(int(sys.argv[2]), sys.argv[3])
     elif m == "lift3d":
         a = sys.argv[2:]
-        lift3d(a[0], float(a[1]), int(a[2]), a[3], *(float(a[4]), int(a[5])) if len(a) > 4 else ())
+        lift3d(a[0], float(a[1]), int(a[2]), a[3], *[float(a[4])] if len(a) > 4 else [],
+               *(float(a[5]), int(a[6])) if len(a) > 6 else ())
