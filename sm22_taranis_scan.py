@@ -2,6 +2,13 @@
 
   python sm22_taranis_scan.py fam2d FAM TH_DEG N OUTDIR [NPSI | K0:K1:DEN]   # 2D two-mode family
   python sm22_taranis_scan.py dense3d N OUTDIR                    # the round-1/2 9-mode 3D IC, dense A
+  python sm22_taranis_scan.py lift3d K3 EPS N OUTDIR [TH_DEG KPSI]  # a 2D tongue state + a 3rd mode
+
+lift3d: the fam2d "10_01" state (theta=15 deg, psi*2/pi = KPSI/128 = 18/128, the V bottom, 2D A_c=0.6)
+on an N^3 box with (x, y, z) = (l, z_2D, ignorable), plus a third mode chi_3 = cos(2pi k3.x), K3 = "001"
+or "011", whose RMS field is EPS times that of the 2D pair. dB = grad(chi) x bhat as in seed2d; all three
+wavevectors are independent, so every relative phase is removable and EPS is the only new parameter.
+EPS=0 reproduces the 2D state exactly (asserted). EPS>0 is genuinely 3D.
 
 fam2d: Ax = cos(psi) cos(2pi k1.x) + sin(psi) cos(2pi k2.x), psi in [0, pi/2] (NPSI points, ends
 included); the relative phase is removable by translation for two modes, so psi (the amplitude
@@ -243,9 +250,61 @@ def dense3d(N, out):
     print(f"[{tag}] stop={r['stop']} steps={r['steps']} wall={r['wall']:.1f}s", flush=True)
 
 
+T3L = [round(0.3 + 0.025*i, 3) for i in range(29)]          # 0.30 ... 1.00
+K3S = {"001": (0, 0, 1), "011": (0, 1, 1)}
+
+
+def lift3d(k3, eps, N, out, th_deg=15.0, kpsi=18):
+    import jax.numpy as jnp
+    import taranis
+    th = np.deg2rad(th_deg); psi = kpsi/128*np.pi/2
+    s_, c_ = np.sin(th), np.cos(th)
+    bh = np.array([c_, 0.0, -s_])
+    modes = [((1, 0, 0), np.cos(psi)), ((0, 1, 0), np.sin(psi))]
+
+    def dB_of(ms, X, Y, Z):
+        G = 0.0
+        for (a, b, c), amp in ms:
+            G = G + amp*jnp.stack([2*np.pi*k*(-jnp.sin(2*np.pi*(a*X + b*Y + c*Z))) for k in (a, b, c)])
+        # grad(chi) x bhat, as seed2d
+        return jnp.stack([G[1]*bh[2] - G[2]*bh[1], G[2]*bh[0] - G[0]*bh[2], G[0]*bh[1] - G[1]*bh[0]])
+    rms = lambda f: jnp.sqrt(jnp.mean(jnp.sum(f**2, 0)))
+
+    def f(x, y, z):
+        d12 = dB_of(modes, x, y, z)
+        dB = d12
+        if eps > 0:
+            d3 = dB_of([(K3S[k3], 1.0)], x, y, z)
+            dB = d12 + d3*(eps*rms(d12)/rms(d3))
+        dB = dB*(A0/rms(dB))
+        return dB + jnp.asarray(bh)[:, None, None, None]
+    p = taranis.Parameters(N, N, 1.0, 1.0, 0.5, eqtype="SM22", dims=3, nz=N, Lz=1.0, z_spectral=True,
+                           eqpars=dict(maxiter=300))
+    if eps == 0:   # the lift must be the 2D state, constant in z
+        x = np.arange(N)/N
+        X, Y, Z = np.meshgrid(x, x, x, indexing="ij")
+        B3 = np.asarray(f(jnp.asarray(X), jnp.asarray(Y), jnp.asarray(Z)))
+        assert np.max(np.abs(B3 - seed2d(N, th, "10_01", psi)[..., None])) < 1e-5, "lift3d != seed2d"
+    st = taranis.initialize(f, p)
+    g = Grower(p)
+    warm(g, st)
+    r = g.grow(st, T3L, wall_cap=1500)
+    tag = f"lift3d_k{k3}_eps{eps:g}_th{th_deg:g}_kpsi{kpsi}_N{N}_fp{os.environ.get('TARANIS_PRECISION', '32')}"
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, tag + ".json"), "w") as fh:
+        json.dump(dict(k3=k3, eps=eps, th_deg=th_deg, kpsi=kpsi, N=N, targets=T3L, **r), fh)
+    for row in r["rows"]:
+        print(f"[{tag}] A={row['target']} mg={row['maxgrad']:.2f} Bout={row['Berr_out']:.2e} "
+              f"Boutmax={row['Berr_out_max']:.2e} edge={row['edge_max']:.3f} its={row['its']}", flush=True)
+    print(f"[{tag}] stop={r['stop']} steps={r['steps']} wall={r['wall']:.1f}s", flush=True)
+
+
 if __name__ == "__main__":
     m = sys.argv[1]
     if m == "fam2d":
         fam2d(sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5], *sys.argv[6:7])
     elif m == "dense3d":
         dense3d(int(sys.argv[2]), sys.argv[3])
+    elif m == "lift3d":
+        a = sys.argv[2:]
+        lift3d(a[0], float(a[1]), int(a[2]), a[3], *(float(a[4]), int(a[5])) if len(a) > 4 else ())
